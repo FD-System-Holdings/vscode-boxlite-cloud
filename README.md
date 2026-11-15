@@ -1,5 +1,7 @@
 # BoxLite Cloud for Visual Studio Code
 
+**Version:** v0.3.0
+
 Deploy and manage applications on **BoxLite Cloud** directly from VS Code.
 
 This extension provides a unified developer experience for creating, deploying, tunneling, configuring network isolation, streaming logs, and inspecting your microVM Box instances within a Boxlite Cloud instance.
@@ -29,6 +31,10 @@ This extension provides a unified developer experience for creating, deploying, 
   - Real-time status for all Boxes (Running, Stopped, Provisioning).
   - Inspect tunnels, active public/private URLs, persistent volumes, and network rules.
   - Direct context menu actions: Start, Stop, Restart, Stream Logs, Exec CLI, Inspect JSON, and Delete.
+- **Custom Domains Explorer (`boxlite.domainsView`):**
+  - Manage custom domains directly from the BoxLite Activity Bar sidebar.
+  - Add custom domains (`Add Domain...`), verify DNS records (`Verify DNS`), and bind domains to Boxes (`Bind Domain to Box...`).
+  - Open verified domains in the browser, copy domain names, inspect domain JSON metadata, and delete domains.
 - **Images Menu & Explorer (`boxlite.imagesView`):**
   - Dedicated Images menu positioned directly between **Boxes** and **Volumes** in the BoxLite Activity Bar sidebar.
   - Browse official BoxLite built-in images (`base`, `python`, `node`, `sandbaseai-hermes`), marked free and exempt from organization image quotas.
@@ -220,6 +226,14 @@ Keep third-party API keys and tokens out of Box guest memory, environment variab
 | `boxlite.configureOutbound` | Configure Outbound Network Policy | Set outbound mode & hostname allowlists |
 | `boxlite.execCommand` | Execute Command in Box... | Run ad-hoc shell commands in Box |
 | `boxlite.inspectBox` | Inspect Box (JSON) | View complete Box state JSON |
+| `boxlite.refreshDomains` | Refresh Domains | Refresh the Custom Domains explorer view |
+| `boxlite.createDomain` | Add Domain... | Register a custom domain in BoxLite Cloud |
+| `boxlite.verifyDomain` | Verify DNS | Trigger DNS verification for a pending/failed domain |
+| `boxlite.bindDomainToBox` | Bind Domain to Box... | Bind a custom domain to a Box |
+| `boxlite.openDomainUrl` | Open Domain in Browser | Open an active/verified custom domain in the browser |
+| `boxlite.copyDomainName` | Copy Domain Name | Copy custom domain name to clipboard |
+| `boxlite.inspectDomain` | Inspect Domain (JSON) | View custom domain state and metadata JSON |
+| `boxlite.deleteDomain` | Delete Domain | Delete a custom domain |
 | `boxlite.refreshImages` | Refresh Images | Refresh the Images catalog and explorer view |
 | `boxlite.addImage` | Use Your Own Image... | Add custom image reference or boot microVM from registry |
 | `boxlite.createBoxFromImage` | Create Box from Image... | Launch a new Box preconfigured with selected image |

@@ -1075,8 +1075,7 @@ export function registerCommands(
       const confirm = await vscode.window.showWarningMessage(
         `Are you sure you want to remove image "${imageName}" from your organization catalog?\nRemoving an image takes its versions, aliases, and history with it. Images used by active boxes cannot be removed (docs.boxlite.ai/cloud/image-catalog).`,
         { modal: true },
-        'Delete Image',
-        'Cancel'
+        'Delete Image'
       );
 
       if (confirm !== 'Delete Image') {

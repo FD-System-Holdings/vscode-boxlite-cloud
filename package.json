@@ -2,7 +2,7 @@
   "name": "boxlite-cloud",
   "displayName": "BoxLite Cloud",
   "description": "Deploy and manage BoxLite cloud applications with ease",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "publisher": "FD-System-Holdings",
   "icon": "media/icon.png",
   "engines": {
