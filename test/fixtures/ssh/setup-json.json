@@ -1,0 +1,5 @@
+{
+  "private_key_path": "/home/alice/.boxlite/ssh/box_01JXYZ1234567890/id_ed25519",
+  "fingerprint": "SHA256:JsonFingerprint9876543210",
+  "ssh_command": "ssh -i /home/alice/.boxlite/ssh/box_01JXYZ1234567890/id_ed25519 -o ProxyCommand=\"boxlite --context vscode-key1 network tunnel --stdio box_01JXYZ1234567890 22\" boxlite@0.0.0.0"
+}

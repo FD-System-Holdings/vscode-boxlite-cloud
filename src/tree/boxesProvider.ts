@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { BoxLiteBridgeClient } from '../bridge/client';
 import { CredentialsManager } from '../auth/credentials';
 import { LogStreamManager } from '../logs/logStream';
+import { SshStore } from '../ssh/sshStore';
 import { BoxLiteTreeItem, BoxTreeItem, BoxChildTreeItem } from './nodes';
 
 export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem> {
@@ -14,7 +15,8 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
   constructor(
     private bridge: BoxLiteBridgeClient,
     private credentials: CredentialsManager,
-    private logManager?: LogStreamManager
+    private logManager?: LogStreamManager,
+    private sshStore?: SshStore
   ) {}
 
   public setStartupReady(ready: boolean): void {
@@ -64,7 +66,7 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
             )
           );
         } else {
-          this.cachedBoxes = boxes.map((b) => new BoxTreeItem(b));
+          this.cachedBoxes = boxes.map((b) => new BoxTreeItem(b, this.sshStore?.isBoxSshReadySync(b.id) ?? false));
           items.push(...this.cachedBoxes);
 
           // Auto-refresh if any box is transitioning (e.g. stopping or starting)
@@ -270,6 +272,24 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
             title: 'Execute Command',
             arguments: [element]
           }
+        )
+      );
+
+      // 5b. SSH Console
+      const sshReady = this.sshStore?.isBoxSshReadySync(element.box.id) ?? false;
+      children.push(
+        new BoxChildTreeItem(
+          'SSH Console',
+          sshReady ? 'Configured · Connect via SSH' : 'Set up & connect via SSH',
+          'remote',
+          {
+            command: 'boxlite.sshConnect',
+            title: 'Connect via SSH',
+            arguments: [element]
+          },
+          vscode.TreeItemCollapsibleState.None,
+          sshReady ? 'box-ssh-action-ready' : 'box-ssh-action',
+          element.box.id
         )
       );
 

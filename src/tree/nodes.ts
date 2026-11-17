@@ -85,7 +85,7 @@ export class BoxTreeItem extends BoxLiteTreeItem {
   public readonly box: BoxListItem;
   public readonly tunnels: TunnelInfo[] = [];
 
-  constructor(box: BoxListItem) {
+  constructor(box: BoxListItem, sshReady = false) {
     super(box.name || `box-${box.id.substring(0, 8)}`, vscode.TreeItemCollapsibleState.Collapsed);
     this.box = box;
     this.tunnels = box.tunnels || [];
@@ -117,7 +117,7 @@ export class BoxTreeItem extends BoxLiteTreeItem {
     // Context value controls context menu and inline actions
     const hasTunnels = this.tunnels.length > 0;
     const hasToken = this.tunnels.some((t) => !!t.token);
-    this.contextValue = `box-${status}${canStop ? '-canStop' : ''}${canStart ? '-canStart' : ''}${isRunning ? '-isRunning' : ''}${isStopped ? '-isStopped' : ''}${hasTunnels ? '-canOpenUrl' : ''}${hasToken ? '-hasToken' : ''}`;
+    this.contextValue = `box-${status}${canStop ? '-canStop' : ''}${canStart ? '-canStart' : ''}${isRunning ? '-isRunning' : ''}${isStopped ? '-isStopped' : ''}${hasTunnels ? '-canOpenUrl' : ''}${hasToken ? '-hasToken' : ''}${sshReady ? '-sshReady' : ''}`;
   }
 }
 

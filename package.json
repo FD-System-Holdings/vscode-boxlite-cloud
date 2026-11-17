@@ -221,6 +221,42 @@
         "icon": "$(terminal)"
       },
       {
+        "command": "boxlite.sshConnect",
+        "title": "Connect via SSH",
+        "category": "BoxLite",
+        "icon": "$(remote)"
+      },
+      {
+        "command": "boxlite.sshSetup",
+        "title": "Set Up / Reset SSH...",
+        "category": "BoxLite",
+        "icon": "$(key)"
+      },
+      {
+        "command": "boxlite.sshCopyCommand",
+        "title": "Copy SSH Command",
+        "category": "BoxLite",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "boxlite.sshDisable",
+        "title": "Disable SSH & Close Tunnel",
+        "category": "BoxLite",
+        "icon": "$(debug-disconnect)"
+      },
+      {
+        "command": "boxlite.sshOpenRemote",
+        "title": "Open in Remote-SSH",
+        "category": "BoxLite",
+        "icon": "$(remote-explorer)"
+      },
+      {
+        "command": "boxlite.sshRemoveConfigEntries",
+        "title": "Remove Managed SSH Config Entries",
+        "category": "BoxLite",
+        "icon": "$(trash)"
+      },
+      {
         "command": "boxlite.inspectBox",
         "title": "Inspect Box (JSON)",
         "category": "BoxLite",
@@ -676,6 +712,11 @@
           "group": "inline@1"
         },
         {
+          "command": "boxlite.sshConnect",
+          "when": "view == boxlite.boxesView && viewItem =~ /.*isRunning.*/",
+          "group": "inline@2"
+        },
+        {
           "command": "boxlite.startBox",
           "when": "view == boxlite.boxesView && (viewItem =~ /.*canStart.*/ || viewItem =~ /.*isStopped.*/)",
           "group": "inline@1"
@@ -699,6 +740,31 @@
           "command": "boxlite.restartApp",
           "when": "view == boxlite.boxesView && viewItem =~ /.*isRunning.*/",
           "group": "1_manage@4"
+        },
+        {
+          "command": "boxlite.sshConnect",
+          "when": "view == boxlite.boxesView && viewItem =~ /.*isRunning.*/",
+          "group": "2_ssh@1"
+        },
+        {
+          "command": "boxlite.sshOpenRemote",
+          "when": "view == boxlite.boxesView && viewItem =~ /.*isRunning.*/",
+          "group": "2_ssh@2"
+        },
+        {
+          "command": "boxlite.sshSetup",
+          "when": "view == boxlite.boxesView && viewItem =~ /.*isRunning.*/",
+          "group": "2_ssh@3"
+        },
+        {
+          "command": "boxlite.sshCopyCommand",
+          "when": "view == boxlite.boxesView && viewItem =~ /.*isRunning.*/ && viewItem =~ /.*sshReady.*/",
+          "group": "2_ssh@4"
+        },
+        {
+          "command": "boxlite.sshDisable",
+          "when": "view == boxlite.boxesView && viewItem =~ /.*isRunning.*/",
+          "group": "2_ssh@5"
         },
         {
           "command": "boxlite.streamLogs",
@@ -945,6 +1011,38 @@
           "type": "boolean",
           "default": true,
           "description": "Whether created boxes should automatically wake up when HTTP requests reach cloud proxy"
+        },
+        "boxlite.ssh.mode": {
+          "type": "string",
+          "enum": ["sdk", "cli"],
+          "default": "sdk",
+          "description": "SSH backend mode: 'sdk' uses BoxLite REST API + built-in Ed25519 keygen and local tunnel forwarding (no boxlite CLI required); 'cli' delegates to the external boxlite CLI."
+        },
+        "boxlite.ssh.transport": {
+          "type": "string",
+          "enum": ["auto", "forwarder", "proxy-command"],
+          "default": "auto",
+          "description": "SDK-mode tunnel transport for Remote-SSH and copied commands: 'auto' uses ProxyCommand (ssh-proxy.js) when Node.js is available and falls back to the in-extension loopback TCP forwarder."
+        },
+        "boxlite.ssh.cliPath": {
+          "type": "string",
+          "default": "boxlite",
+          "description": "Path to the BoxLite CLI executable used when boxlite.ssh.mode is set to 'cli'"
+        },
+        "boxlite.ssh.sshPath": {
+          "type": "string",
+          "default": "ssh",
+          "description": "Path to the OpenSSH client executable (ssh)"
+        },
+        "boxlite.ssh.contextPrefix": {
+          "type": "string",
+          "default": "vscode",
+          "description": "Prefix for the dedicated BoxLite CLI context created by the VS Code extension (e.g. vscode-<keyId>)"
+        },
+        "boxlite.ssh.manageConfig": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in: automatically manage BoxLite Host blocks inside ~/.ssh/config for Remote-SSH"
         }
       }
     }
@@ -953,7 +1051,7 @@
     "vscode:prepublish": "npm run build",
     "compile": "tsc -p ./",
     "watch": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
-    "build": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "build": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap && esbuild ./src/ssh/proxyEntry.ts --bundle --outfile=dist/ssh-proxy.js --format=cjs --platform=node --sourcemap",
     "package": "npx @vscode/vsce package",
     "test": "tsc -p ./tsconfig.test.json && mocha -r test/mock-vscode.js out/test/**/*.test.js"
   },

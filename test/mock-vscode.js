@@ -7,18 +7,44 @@ const mockVscode = {
   workspace: {
     workspaceFolders: [],
     getConfiguration: () => ({
-      get: (_key, def) => def
+      get: (_key, def) => def,
+      update: async () => {}
     }),
     openTextDocument: async () => ({}),
   },
   window: {
+    terminals: [],
+    onDidCloseTerminal: () => ({ dispose: () => {} }),
+    createTerminal: (options) => {
+      const term = {
+        name: options?.name || 'Terminal',
+        creationOptions: options,
+        sentTexts: [],
+        shown: false,
+        disposed: false,
+        show: () => {
+          term.shown = true;
+        },
+        sendText: (text) => {
+          term.sentTexts.push(text);
+        },
+        dispose: () => {
+          term.disposed = true;
+        }
+      };
+      mockVscode.window.terminals.push(term);
+      return term;
+    },
     showInformationMessage: async () => {},
     showErrorMessage: async () => {},
     showWarningMessage: async () => {},
     createOutputChannel: () => ({
       append: () => {},
       appendLine: () => {},
+      replace: () => {},
+      clear: () => {},
       show: () => {},
+      hide: () => {},
       dispose: () => {}
     }),
     showInputBox: async () => undefined,
@@ -26,6 +52,20 @@ const mockVscode = {
     withProgress: async (_options, task) => {
       return await task({ report: () => {} });
     }
+  },
+  env: {
+    clipboard: {
+      writeText: async () => {}
+    },
+    openExternal: async () => true
+  },
+  extensions: {
+    getExtension: () => undefined
+  },
+  ConfigurationTarget: {
+    Global: 1,
+    Workspace: 2,
+    WorkspaceFolder: 3
   },
   ProgressLocation: {
     Notification: 15,

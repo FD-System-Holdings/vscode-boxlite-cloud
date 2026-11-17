@@ -12,6 +12,7 @@ import { SecretsTreeDataProvider } from './tree/secretsProvider';
 import { AccountTreeDataProvider } from './tree/accountProvider';
 import { BoxLiteDeployer } from './deploy/deployer';
 import { LogStreamManager } from './logs/logStream';
+import { SshService, SshStore } from './ssh';
 import { registerCommands } from './commands';
 
 let statusBarItem: vscode.StatusBarItem;
@@ -190,11 +191,15 @@ export async function activate(context: vscode.ExtensionContext) {
   const bridge = new BoxLiteBridgeClient(context, credentials, envManager, outputChannel);
   context.subscriptions.push(bridge);
 
+  const sshOutputChannel = createSafeLazyOutputChannel('BoxLite SSH');
+  context.subscriptions.push(sshOutputChannel);
+  const sshStore = new SshStore(context);
+
   const logManager = new LogStreamManager(bridge);
   context.subscriptions.push(logManager);
 
   const accountProvider = new AccountTreeDataProvider(credentials);
-  const treeProvider = new BoxesTreeDataProvider(bridge, credentials, logManager);
+  const treeProvider = new BoxesTreeDataProvider(bridge, credentials, logManager, sshStore);
   const domainsProvider = new DomainsTreeDataProvider(bridge, credentials);
   const imagesProvider = new ImagesTreeDataProvider(bridge, credentials);
   const volumesProvider = new VolumesTreeDataProvider(bridge, credentials);
@@ -272,6 +277,17 @@ export async function activate(context: vscode.ExtensionContext) {
     secretsManager
   );
 
+  const sshService = new SshService(
+    context,
+    bridge,
+    credentials,
+    sshOutputChannel,
+    () => treeProvider.refresh(),
+    undefined,
+    sshStore
+  );
+  context.subscriptions.push(sshService);
+
   // Register all commands
   registerCommands(
     context,
@@ -287,7 +303,8 @@ export async function activate(context: vscode.ExtensionContext) {
     checkpointsProvider,
     secretsProvider,
     secretsManager,
-    domainsProvider
+    domainsProvider,
+    sshService
   );
 
   // Configuration change listener

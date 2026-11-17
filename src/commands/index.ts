@@ -26,6 +26,7 @@ import { BoxLiteDeployer } from '../deploy/deployer';
 import { scaffoldNewProject } from '../deploy/scaffold';
 import { ProjectManager, DEFAULT_CONFIG } from '../deploy/project';
 import { LogStreamManager } from '../logs/logStream';
+import { SshService } from '../ssh';
 import {
   validateNetworkPolicy,
   validateAllowlistRule,
@@ -68,7 +69,8 @@ export function registerCommands(
   checkpointsProvider?: CheckpointsTreeDataProvider,
   secretsProvider?: SecretsTreeDataProvider,
   secretsManager?: SecretsManager,
-  domainsProvider?: DomainsTreeDataProvider
+  domainsProvider?: DomainsTreeDataProvider,
+  sshService?: SshService
 ) {
   const refreshAllViews = () => {
     bridge.restartBridge();
@@ -2436,6 +2438,87 @@ export function registerCommands(
         const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
         vscode.window.showErrorMessage(`Failed to delete domain: ${msg}`);
       }
+    })
+  );
+
+  // SSH commands
+  const requireSshService = (): SshService | undefined => {
+    if (!sshService) {
+      vscode.window.showErrorMessage('BoxLite SSH service is not initialized.');
+      return undefined;
+    }
+    return sshService;
+  };
+
+  const resolveBoxTarget = async (item?: any): Promise<{ boxId: string; boxName?: string } | undefined> => {
+    if (item && typeof item === 'object' && item.box && item.box.id) {
+      return { boxId: item.box.id, boxName: item.box.name };
+    }
+    if (item && typeof item === 'object' && item.boxId) {
+      return { boxId: item.boxId };
+    }
+    const boxId = await resolveBoxId(item, bridge);
+    if (!boxId) {
+      return undefined;
+    }
+    return { boxId };
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('boxlite.sshConnect', async (item?: BoxTreeItem | string) => {
+      const svc = requireSshService();
+      if (!svc) return;
+      const target = await resolveBoxTarget(item);
+      if (!target) return;
+      await svc.connect(target.boxId, target.boxName);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('boxlite.sshSetup', async (item?: BoxTreeItem | string) => {
+      const svc = requireSshService();
+      if (!svc) return;
+      const target = await resolveBoxTarget(item);
+      if (!target) return;
+      await svc.setup(target.boxId, target.boxName);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('boxlite.sshCopyCommand', async (item?: BoxTreeItem | string) => {
+      const svc = requireSshService();
+      if (!svc) return;
+      const target = await resolveBoxTarget(item);
+      if (!target) return;
+      await svc.copyCommand(target.boxId, target.boxName);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('boxlite.sshDisable', async (item?: BoxTreeItem | string) => {
+      const svc = requireSshService();
+      if (!svc) return;
+      const target = await resolveBoxTarget(item);
+      if (!target) return;
+      await svc.disable(target.boxId, target.boxName);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('boxlite.sshOpenRemote', async (item?: BoxTreeItem | string) => {
+      const svc = requireSshService();
+      if (!svc) return;
+      const target = await resolveBoxTarget(item);
+      if (!target) return;
+      await svc.openRemote(target.boxId, target.boxName);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('boxlite.sshRemoveConfigEntries', async () => {
+      const svc = requireSshService();
+      if (!svc) return;
+      await svc.removeConfigEntries();
     })
   );
 }

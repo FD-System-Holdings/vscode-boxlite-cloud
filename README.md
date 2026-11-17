@@ -204,6 +204,31 @@ Keep third-party API keys and tokens out of Box guest memory, environment variab
 
 ---
 
+## Cloud SSH & Remote-SSH (`https://docs.boxlite.ai/cloud/ssh`)
+
+Connect directly to any Cloud Box's interactive shell or open a remote VS Code workspace without requiring a public box IP or installing the `boxlite` CLI:
+
+- **Zero-CLI Default (`boxlite.ssh.mode: "sdk"`):** Only a local OpenSSH client (`ssh`) is required:
+  - **Built-In Key Management:** Generates Ed25519 client and host keys locally via Node.js `crypto` (stored with `0600` permissions in extension storage) and pins the expected host public key in a per-box `known_hosts` file with `StrictHostKeyChecking yes`.
+  - **Direct Guest SSH REST API:** Enables inbound access and configures/enables/checks/disables guest SSH directly against `/v1/boxes/{id}/ssh` without invoking `boxlite ssh`.
+  - **One-Shot Raw Tunnel Forwarding:** Integrated terminal connections use an in-extension loopback TCP forwarder (`127.0.0.1:<ephemeralPort>`) that prepares a fresh one-shot tunnel (`POST /v1/boxes/{id}/network/tunnel?port=22`) and upgrades it via HTTP `CONNECT` on each connection. Remote-SSH and copied commands can also use the bundled `dist/ssh-proxy.js` `ProxyCommand` relay backed by a local authenticated loopback broker (never writing API keys to disk) or `BOXLITE_API_KEY`.
+- **Optional CLI Mode (`boxlite.ssh.mode: "cli"`):** Uses an isolated `vscode-<keyId>` context with your local `boxlite` CLI (`--api-key-stdin`) and probes `boxlite ssh --help` for `--json` output with a structured text parser fallback.
+- **Disable & Tunnel Revocation:** **Disable SSH & Close Tunnel** (`boxlite.sshDisable`) always revokes port 22 before disabling guest SSH.
+- **VS Code Remote-SSH (Opt-In Config):** **Open in Remote-SSH** (`boxlite.sshOpenRemote`) checks for `ms-vscode-remote.remote-ssh` (offering to install it if absent), writes a marker-delimited `Host boxlite-<name>` block (opt-in via `boxlite.ssh.manageConfig` or per-host confirmation, with atomic writes and a `.boxlite.bak` backup), and opens the remote VS Code window.
+
+### SSH Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `boxlite.ssh.mode` | `sdk` | SSH backend (`sdk` = built-in REST + tunnel forwarder without `boxlite` CLI; `cli` = external `boxlite` CLI) |
+| `boxlite.ssh.transport` | `auto` | SDK-mode Remote-SSH / copy transport (`auto`, `forwarder`, `proxy-command`) |
+| `boxlite.ssh.cliPath` | `boxlite` | Path to the BoxLite CLI executable (used when `mode` is `cli`) |
+| `boxlite.ssh.sshPath` | `ssh` | Path to the OpenSSH client executable |
+| `boxlite.ssh.contextPrefix` | `vscode` | Prefix for the extension-managed CLI context (`vscode-<keyId>`) |
+| `boxlite.ssh.manageConfig` | `false` | Opt-in: automatically manage BoxLite Host blocks inside `~/.ssh/config` |
+
+---
+
 ## Extension Commands
 
 | Command | Title | Description |
@@ -225,6 +250,12 @@ Keep third-party API keys and tokens out of Box guest memory, environment variab
 | `boxlite.setAccess` | Configure Inbound / Public Access | Configure tunnel & public/private status |
 | `boxlite.configureOutbound` | Configure Outbound Network Policy | Set outbound mode & hostname allowlists |
 | `boxlite.execCommand` | Execute Command in Box... | Run ad-hoc shell commands in Box |
+| `boxlite.sshConnect` | Connect via SSH | Open an interactive SSH terminal to the Box |
+| `boxlite.sshOpenRemote` | Open in Remote-SSH | Open the Box in a VS Code Remote-SSH window |
+| `boxlite.sshSetup` | Set Up / Reset SSH... | Configure or reset SSH keys for the Box |
+| `boxlite.sshCopyCommand` | Copy SSH Command | Copy the full `ssh` command to clipboard |
+| `boxlite.sshDisable` | Disable SSH & Close Tunnel | Revoke port 22 tunnel and disable SSH on the Box |
+| `boxlite.sshRemoveConfigEntries` | Remove Managed SSH Config Entries | Remove BoxLite-managed blocks from `~/.ssh/config` |
 | `boxlite.inspectBox` | Inspect Box (JSON) | View complete Box state JSON |
 | `boxlite.refreshDomains` | Refresh Domains | Refresh the Custom Domains explorer view |
 | `boxlite.createDomain` | Add Domain... | Register a custom domain in BoxLite Cloud |

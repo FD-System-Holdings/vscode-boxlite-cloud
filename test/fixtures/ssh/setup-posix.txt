@@ -1,0 +1,6 @@
+Guest SSH configured for box_01JXYZ1234567890.
+* Private key path: /home/alice/.boxlite/ssh/box_01JXYZ1234567890/id_ed25519
+* Host key fingerprint: SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/ABCD
+
+Copy and run the following command to enter the box:
+ssh -i /home/alice/.boxlite/ssh/box_01JXYZ1234567890/id_ed25519 -o ProxyCommand="boxlite --context vscode-key1 network tunnel --stdio box_01JXYZ1234567890 22" boxlite@0.0.0.0
