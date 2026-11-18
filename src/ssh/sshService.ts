@@ -32,7 +32,7 @@ import {
   validateBoxId,
   validateParsedSetup
 } from './parse';
-import { BoxliteRestSshClient } from './restClient';
+import { BoxliteRestSshClient, parseListenPort } from './restClient';
 import { SshConfigFileManager, SshHostBlockSpec } from './sshConfig';
 import { SshStore, StoredSshConfig } from './sshStore';
 import { LocalTunnelBroker } from './tunnelBroker';
@@ -91,7 +91,29 @@ export class SshService implements vscode.Disposable {
 
     this.forwarderManager =
       forwarderManager ??
-      new LocalForwarderManager(this.restClient, supplyCredentials, (msg) => this.log(msg));
+      new LocalForwarderManager(
+        this.restClient,
+        supplyCredentials,
+        (msg) => this.log(msg),
+        (boxId, err) => {
+          this.outputChannel.show(true);
+          const detail = err instanceof Error ? err.message : String(err);
+          if (
+            (err instanceof SshCliError && err.code === 'NETWORK_DISABLED') ||
+            detail.includes('created with Outbound Network disabled')
+          ) {
+            void this.showNetworkDisabledError(detail);
+            return;
+          }
+          void vscode.window
+            .showErrorMessage(`SSH tunnel for "${boxId}" failed: ${detail}`, 'Show SSH Output')
+            .then((choice) => {
+              if (choice === 'Show SSH Output') {
+                this.outputChannel.show(true);
+              }
+            });
+        }
+      );
 
     this.tunnelBroker =
       tunnelBroker ??
@@ -185,7 +207,11 @@ export class SshService implements vscode.Disposable {
     return { bin: nodeBin, proxyScript };
   }
 
-  private async buildSdkProxyCommand(boxId: string, restUrl: string): Promise<string | undefined> {
+  private async buildSdkProxyCommand(
+    boxId: string,
+    restUrl: string,
+    targetPort = 22
+  ): Promise<string | undefined> {
     const resolved = await this.resolveProxyCommandBin();
     if (!resolved) {
       return undefined;
@@ -196,7 +222,7 @@ export class SshService implements vscode.Disposable {
       '--box',
       boxId,
       '--port',
-      '22',
+      String(targetPort),
       '--broker',
       brokerPath,
       '--url',
@@ -386,6 +412,7 @@ export class SshService implements vscode.Disposable {
     const { restUrl, apiKey } = creds;
     this.log(`Ensuring inbound network enabled for box ${boxId} via REST API...`);
     await this.restClient.enableInbound(restUrl, apiKey, boxId);
+    await this.restClient.ensureTunnelReachable(restUrl, apiKey, boxId, (msg) => this.log(msg));
 
     const scopeIdentity = `${restUrl.replace(/\/+$/, '')}|${contextName}`;
     const bundle = ensureBoxKeyBundle(
@@ -437,6 +464,12 @@ export class SshService implements vscode.Disposable {
     }
 
     if (status.host_public_key && !publicKeysMatch(status.host_public_key, bundle.hostPublicKey)) {
+      if (options.forceSetup) {
+        throw new SshCliError(
+          'UNKNOWN',
+          `The SSH host key reported for "${boxName}" still does not match the newly generated extension-managed host key.`
+        );
+      }
       const choice = await vscode.window.showWarningMessage(
         `The SSH host key reported for "${boxName}" does not match the extension-managed host key.\n\nExpected: ${bundle.hostFingerprint}\nReported: ${status.host_key_fingerprint || '(unknown)'}\n\nReset SSH to install a fresh matching host keypair?`,
         { modal: true },
@@ -455,6 +488,7 @@ export class SshService implements vscode.Disposable {
     writePinnedKnownHosts(bundle.knownHostsPath, hostKeyAlias, bundle.hostPublicKey);
 
     const fingerprint = status.host_key_fingerprint || bundle.hostFingerprint;
+    const targetPort = parseListenPort(status.listen_address, 22);
     const sshArgs = this.buildSdkLoopbackArgs(
       bundle.clientKeyPath,
       bundle.knownHostsPath,
@@ -473,6 +507,7 @@ export class SshService implements vscode.Disposable {
       hostKeyAlias,
       hostPublicKey: bundle.hostPublicKey,
       loginUser: 'box',
+      targetPort,
       fingerprint,
       sshBin: openSsh.sshBin,
       sshArgs,
@@ -498,6 +533,26 @@ export class SshService implements vscode.Disposable {
       }
       await this.store.markTrusted(contextName, boxId);
       stored.trustedAt = new Date().toISOString();
+      const stillRunning = await this.ensureBoxRunning(boxId, boxName);
+      if (!stillRunning.ok) {
+        return undefined;
+      }
+      try {
+        const postStatus = await this.restClient.getSshStatus(restUrl, apiKey, boxId);
+        if (!postStatus.enabled && postStatus.generation > 0) {
+          this.log(`Guest SSH became disabled on box ${boxId}; enabling saved configuration via REST API...`);
+          const enabledPost = await this.restClient.enableSsh(restUrl, apiKey, boxId);
+          const refreshedPort = parseListenPort(enabledPost.listen_address, stored.targetPort ?? 22);
+          if (refreshedPort !== stored.targetPort) {
+            stored.targetPort = refreshedPort;
+            await this.store.set(contextName, stored);
+          }
+        }
+      } catch (err) {
+        if (!(err instanceof SshCliError && err.code === 'BOX_NOT_FOUND')) {
+          throw err;
+        }
+      }
     }
 
     return stored;
@@ -797,10 +852,27 @@ export class SshService implements vscode.Disposable {
     terminal.show();
   }
 
+  private async showNetworkDisabledError(message: string): Promise<void> {
+    const choice = await vscode.window.showErrorMessage(
+      message,
+      'Create Box with Options...',
+      'Show SSH Output'
+    );
+    if (choice === 'Create Box with Options...') {
+      await vscode.commands.executeCommand('boxlite.createBoxWithOptions');
+    } else if (choice === 'Show SSH Output') {
+      this.outputChannel.show(true);
+    }
+  }
+
   private async handleSshError(err: unknown, boxId?: string, boxName?: string): Promise<void> {
     if (err instanceof SshCliError) {
       this.log(`Error [${err.code}]: ${err.message}`);
       switch (err.code) {
+        case 'NETWORK_DISABLED': {
+          await this.showNetworkDisabledError(err.message);
+          return;
+        }
         case 'CLI_NOT_FOUND': {
           const action = await vscode.window.showErrorMessage(
             err.message,
@@ -942,7 +1014,10 @@ export class SshService implements vscode.Disposable {
           }
           await this.fixKeyPermissionsQuietly(config.keyPath);
 
-          const { port: localPort } = await this.forwarderManager.ensureForwarder(boxId, 22);
+          const { port: localPort } = await this.forwarderManager.ensureForwarder(
+            boxId,
+            config.targetPort || 22
+          );
           const loopArgs = this.buildSdkLoopbackArgs(
             config.keyPath,
             config.knownHostsPath!,
@@ -1142,8 +1217,11 @@ export class SshService implements vscode.Disposable {
       }
 
       const restUrl = this.credentials.getRestUrl();
+      const targetPort = stored.targetPort || 22;
       const proxyCmd =
-        settings.transport !== 'forwarder' ? await this.buildSdkProxyCommand(boxId, restUrl) : undefined;
+        settings.transport !== 'forwarder'
+          ? await this.buildSdkProxyCommand(boxId, restUrl, targetPort)
+          : undefined;
 
       let args: string[];
       if (proxyCmd) {
@@ -1163,7 +1241,7 @@ export class SshService implements vscode.Disposable {
           `${stored.loginUser || 'box'}@${stored.hostKeyAlias}`
         ];
       } else {
-        const { port: localPort } = await this.forwarderManager.ensureForwarder(boxId, 22);
+        const { port: localPort } = await this.forwarderManager.ensureForwarder(boxId, targetPort);
         args = this.buildSdkLoopbackArgs(
           stored.keyPath,
           stored.knownHostsPath!,
@@ -1211,6 +1289,7 @@ export class SshService implements vscode.Disposable {
         },
         async () => {
           const contextName = await this.getActiveContextName();
+          const targetPort = this.store.get(contextName, boxId)?.targetPort || 22;
 
           if (settings.mode === 'cli') {
             const { cliInfo } = await this.runCliPreflight();
@@ -1218,18 +1297,18 @@ export class SshService implements vscode.Disposable {
             if (!loggedIn) {
               return;
             }
-            // Always revoke tunnel 22 before disabling SSH per BoxLite Cloud docs
-            await this.cli.revokeTunnel(cliInfo, contextName, boxId, 22);
+            // Always revoke tunnel before disabling SSH per BoxLite Cloud docs
+            await this.cli.revokeTunnel(cliInfo, contextName, boxId, targetPort);
             await this.cli.sshDisable(cliInfo, contextName, boxId);
           } else {
             const creds = await this.ensureSdkCredentials();
             if (!creds) {
               return;
             }
-            // Always revoke tunnel 22 before disabling SSH per BoxLite Cloud docs
-            await this.restClient.revokeTunnel(creds.restUrl, creds.apiKey, boxId, 22);
+            // Always revoke tunnel before disabling SSH per BoxLite Cloud docs
+            await this.restClient.revokeTunnel(creds.restUrl, creds.apiKey, boxId, targetPort);
             await this.restClient.disableSsh(creds.restUrl, creds.apiKey, boxId);
-            await this.forwarderManager.stopForwarder(boxId, 22);
+            await this.forwarderManager.stopForwarder(boxId, targetPort);
 
             const scopeIdentity = `${creds.restUrl.replace(/\/+$/, '')}|${contextName}`;
             removeBoxKeyBundle(this.getStorageRoot(), scopeIdentity, boxId);
@@ -1267,37 +1346,26 @@ export class SshService implements vscode.Disposable {
       settings.transport === 'proxy-command' ||
       (settings.transport === 'auto' && Boolean(await this.resolveProxyCommandBin()));
 
+    const targetPort = config.targetPort || 22;
+    const proxyCmd = useProxyCommand
+      ? await this.buildSdkProxyCommand(config.boxId, restUrl, targetPort)
+      : undefined;
+
     let specBase: Omit<SshHostBlockSpec, 'alias'> & { boxName?: string };
-    if (useProxyCommand) {
-      const proxyCmd = await this.buildSdkProxyCommand(config.boxId, restUrl);
-      if (proxyCmd) {
-        specBase = {
-          boxId: config.boxId,
-          boxName,
-          hostName: config.hostKeyAlias || config.boxId,
-          user: config.loginUser || 'box',
-          identityFile: config.keyPath,
-          userKnownHostsFile: config.knownHostsPath,
-          hostKeyAlias: config.hostKeyAlias,
-          strictHostKeyChecking: 'yes',
-          proxyCommand: proxyCmd
-        };
-      } else {
-        const { port: localPort } = await this.forwarderManager.ensureForwarder(config.boxId, 22);
-        specBase = {
-          boxId: config.boxId,
-          boxName,
-          hostName: '127.0.0.1',
-          port: String(localPort),
-          user: config.loginUser || 'box',
-          identityFile: config.keyPath,
-          userKnownHostsFile: config.knownHostsPath,
-          hostKeyAlias: config.hostKeyAlias,
-          strictHostKeyChecking: 'yes'
-        };
-      }
+    if (proxyCmd) {
+      specBase = {
+        boxId: config.boxId,
+        boxName,
+        hostName: config.hostKeyAlias || config.boxId,
+        user: config.loginUser || 'box',
+        identityFile: config.keyPath,
+        userKnownHostsFile: config.knownHostsPath,
+        hostKeyAlias: config.hostKeyAlias,
+        strictHostKeyChecking: 'yes',
+        proxyCommand: proxyCmd
+      };
     } else {
-      const { port: localPort } = await this.forwarderManager.ensureForwarder(config.boxId, 22);
+      const { port: localPort } = await this.forwarderManager.ensureForwarder(config.boxId, targetPort);
       specBase = {
         boxId: config.boxId,
         boxName,

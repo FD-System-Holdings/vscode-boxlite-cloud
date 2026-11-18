@@ -28,6 +28,7 @@ export type SshErrorCode =
   | 'OPENSSH_NOT_FOUND'
   | 'AUTH_FAILED'
   | 'BOX_NOT_FOUND'
+  | 'NETWORK_DISABLED'
   | 'SSH_DISABLED'
   | 'PERMISSION_DENIED_KEY'
   | 'PUBLICKEY_AUTH_FAILED'
@@ -207,6 +208,14 @@ export function classifyCliOutputError(result: ExecResult): SshCliError {
 
   if (lower.includes('ssh is disabled') || (lower.includes('ssh') && lower.includes('disabled'))) {
     return new SshCliError('SSH_DISABLED', 'SSH is currently disabled on this box.', combined);
+  }
+
+  if (lower.includes('box networking is disabled') || lower.includes('no guest nic')) {
+    return new SshCliError(
+      'NETWORK_DISABLED',
+      'Box was created with Outbound Network disabled (no guest NIC provisioned at creation). BoxLite Cloud SSH tunnels require a guest NIC — create a box with Outbound Network enabled.',
+      combined
+    );
   }
 
   if (lower.includes('bad permissions') || lower.includes('unprotected private key')) {

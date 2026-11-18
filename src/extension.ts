@@ -349,6 +349,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }
 
     outputChannel.flush();
+    sshOutputChannel.flush();
 
     scheduleStartupStep(async () => {
       try {

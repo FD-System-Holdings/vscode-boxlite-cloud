@@ -15,6 +15,7 @@ export interface StoredSshConfig {
   hostKeyAlias?: string;
   hostPublicKey?: string;
   loginUser?: string;
+  targetPort?: number;
   fingerprint: string;
   sshBin: string;
   sshArgs: string[];

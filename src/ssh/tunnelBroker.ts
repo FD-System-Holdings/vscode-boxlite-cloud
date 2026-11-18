@@ -4,7 +4,7 @@ import * as net from 'net';
 import * as path from 'path';
 import { CredentialsSupplier } from './localForwarder';
 import { validateBoxId } from './parse';
-import { BoxliteRestSshClient } from './restClient';
+import { BoxliteRestSshClient, openTunnelWithRecovery } from './restClient';
 
 export interface BrokerDescriptor {
   port: number;
@@ -122,11 +122,20 @@ export class LocalTunnelBroker {
     try {
       const { boxId, port, leftover } = await this.readHandshake(clientSocket, expectedSecret);
       const { restUrl, apiKey } = await this.getCredentials();
-      const descriptor = await this.restClient.prepareTunnel(restUrl, apiKey, boxId, port, true);
-      tunnelSocket = await this.restClient.openTunnelStream(descriptor.uri, apiKey);
+      tunnelSocket = await openTunnelWithRecovery(
+        this.restClient,
+        restUrl,
+        apiKey,
+        boxId,
+        port,
+        () => clientSocket.destroyed,
+        this.onLog
+      );
 
-      if (clientSocket.destroyed) {
-        tunnelSocket.destroy();
+      if (!tunnelSocket || clientSocket.destroyed) {
+        if (tunnelSocket && !tunnelSocket.destroyed) {
+          tunnelSocket.destroy();
+        }
         return;
       }
 

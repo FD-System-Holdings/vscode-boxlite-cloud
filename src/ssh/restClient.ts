@@ -31,6 +31,16 @@ export interface TunnelDescriptorResponse {
   token?: string | null;
 }
 
+export interface BoxNetworkInfoResponse {
+  box_id?: string;
+  name?: string | null;
+  status?: string;
+  network?: {
+    inbound?: { mode?: 'enabled' | 'disabled'; allow_net?: string[] };
+    outbound?: { mode?: 'enabled' | 'disabled'; allow_net?: string[] };
+  };
+}
+
 export interface RestHttpTransport {
   request(
     method: string,
@@ -87,6 +97,22 @@ export function assertValidPort(port: number): number {
   return port;
 }
 
+export function parseListenPort(listenAddress?: string, fallbackPort = 22): number {
+  const trimmed = (listenAddress || '').trim();
+  if (!trimmed) {
+    return fallbackPort;
+  }
+  const colonIdx = trimmed.lastIndexOf(':');
+  if (colonIdx === -1) {
+    return fallbackPort;
+  }
+  const port = Number(trimmed.slice(colonIdx + 1));
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return fallbackPort;
+  }
+  return port;
+}
+
 export class NodeRestHttpTransport implements RestHttpTransport {
   public request(
     method: string,
@@ -103,6 +129,8 @@ export class NodeRestHttpTransport implements RestHttpTransport {
       const reqHeaders: Record<string, string> = { ...headers };
       if (body !== undefined) {
         reqHeaders['Content-Length'] = String(Buffer.byteLength(body, 'utf-8'));
+      } else if (method.toUpperCase() === 'POST' || method.toUpperCase() === 'PUT') {
+        reqHeaders['Content-Length'] = '0';
       }
 
       const req = mod.request(
@@ -160,6 +188,13 @@ function parseErrorMessage(statusCode: number, body: string): SshCliError {
   if (statusCode === 404) {
     return new SshCliError('BOX_NOT_FOUND', msg || 'Box not found in BoxLite Cloud (404).');
   }
+  if (msg.toLowerCase().includes('box networking is disabled')) {
+    return new SshCliError(
+      'NETWORK_DISABLED',
+      'Box was created with Outbound Network disabled (no guest NIC provisioned at creation, e.g. Quick Create / Air-Gapped mode). BoxLite Cloud SSH tunnels require a guest NIC — create a box with Outbound Network enabled.',
+      body
+    );
+  }
   return new SshCliError('UNKNOWN', msg || `BoxLite Cloud API returned HTTP ${statusCode}.`, body);
 }
 
@@ -214,12 +249,72 @@ export class BoxliteRestSshClient {
     }
   }
 
+  public async getBox(
+    restUrl: string,
+    apiKey: string,
+    boxId: string
+  ): Promise<BoxNetworkInfoResponse> {
+    const safeId = encodeURIComponent(validateBoxId(boxId));
+    return this.requestJson<BoxNetworkInfoResponse>('GET', restUrl, apiKey, `/boxes/${safeId}`);
+  }
+
   public async enableInbound(restUrl: string, apiKey: string, boxId: string): Promise<void> {
     const safeId = encodeURIComponent(validateBoxId(boxId));
     await this.requestJson('PUT', restUrl, apiKey, `/boxes/${safeId}/network/inbound`, {
       mode: 'enabled',
       allow_net: []
     });
+  }
+
+  public async enableOutbound(
+    restUrl: string,
+    apiKey: string,
+    boxId: string,
+    allowNet: string[] = []
+  ): Promise<void> {
+    const safeId = encodeURIComponent(validateBoxId(boxId));
+    await this.requestJson('PUT', restUrl, apiKey, `/boxes/${safeId}/network/outbound`, {
+      mode: 'enabled',
+      allow_net: allowNet
+    });
+  }
+
+  public async ensureTunnelReachable(
+    restUrl: string,
+    apiKey: string,
+    boxId: string,
+    onLog?: (msg: string) => void
+  ): Promise<void> {
+    let box: BoxNetworkInfoResponse;
+    try {
+      box = await this.getBox(restUrl, apiKey, boxId);
+    } catch (err) {
+      if (err instanceof SshCliError && err.code === 'BOX_NOT_FOUND') {
+        return;
+      }
+      throw err;
+    }
+
+    if (box.network?.inbound?.mode === 'disabled') {
+      await this.enableInbound(restUrl, apiKey, boxId);
+    }
+
+    if (box.network?.outbound?.mode === 'disabled') {
+      onLog?.(`Outbound network is disabled on box ${boxId} (guest NIC inactive); enabling outbound network via REST API...`);
+      try {
+        await this.enableOutbound(restUrl, apiKey, boxId, box.network?.outbound?.allow_net || []);
+      } catch (err) {
+        if (err instanceof SshCliError && err.code === 'AUTH_FAILED') {
+          throw err;
+        }
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new SshCliError(
+          'NETWORK_DISABLED',
+          `Box "${box.name || boxId}" (${boxId}) was created with Outbound Network disabled (no guest NIC provisioned at creation, e.g. Quick Create / Air-Gapped mode). BoxLite Cloud SSH tunnels require a guest NIC — create a box with Outbound Network enabled.`,
+          detail
+        );
+      }
+    }
   }
 
   public async getSshStatus(
@@ -299,7 +394,7 @@ export class BoxliteRestSshClient {
 
     const isHttps = parsed.protocol === 'https:';
     const port = parsed.port ? Number(parsed.port) : isHttps ? 443 : 80;
-    const authority = parsed.host; // hostname or hostname:port
+    const authority = `${parsed.hostname}:${port}`;
 
     return new Promise<net.Socket>((resolve, reject) => {
       let settled = false;
@@ -372,26 +467,38 @@ export class BoxliteRestSshClient {
           return;
         }
 
-        // Non-2xx refusal: read short error body bounded by 512 bytes / 2s like upstream client.rs
+        // Non-2xx refusal: read short error body bounded by Content-Length / 512 bytes / 2s like upstream client.rs
         socket.removeListener('data', onHandshakeData);
         socket.removeListener('close', onHandshakeClose);
+        const contentLengthMatch = /^content-length:\s*(\d+)\s*$/im.exec(headerText);
+        const expectedRefusalBytes = contentLengthMatch
+          ? Math.min(Number(contentLengthMatch[1]), CONNECT_REFUSAL_MAX_BYTES)
+          : CONNECT_REFUSAL_MAX_BYTES;
+        let refusalTimer: ReturnType<typeof setTimeout> | undefined;
         let refusalBuf = leftover.subarray(0, CONNECT_REFUSAL_MAX_BYTES);
+        let refusalDone = false;
         const finishRefusal = () => {
-          clearTimeout(refusalTimer);
+          if (refusalDone) {
+            return;
+          }
+          refusalDone = true;
+          if (refusalTimer !== undefined) {
+            clearTimeout(refusalTimer);
+          }
           const detail = refusalBuf.toString('utf-8').trim() || `CONNECT rejected with HTTP ${statusCode}`;
           fail(parseErrorMessage(statusCode, detail));
         };
-        if (refusalBuf.length >= CONNECT_REFUSAL_MAX_BYTES) {
+        if (refusalBuf.length >= expectedRefusalBytes) {
           finishRefusal();
           return;
         }
-        const refusalTimer = setTimeout(finishRefusal, CONNECT_REFUSAL_TIMEOUT_MS);
+        refusalTimer = setTimeout(finishRefusal, CONNECT_REFUSAL_TIMEOUT_MS);
         socket.on('data', (more: Buffer) => {
           const remaining = CONNECT_REFUSAL_MAX_BYTES - refusalBuf.length;
           if (remaining > 0) {
             refusalBuf = Buffer.concat([refusalBuf, more.subarray(0, remaining)]);
           }
-          if (refusalBuf.length >= CONNECT_REFUSAL_MAX_BYTES) {
+          if (refusalBuf.length >= expectedRefusalBytes) {
             finishRefusal();
           }
         });
@@ -416,4 +523,55 @@ export class BoxliteRestSshClient {
       socket.on('close', onHandshakeClose);
     });
   }
+}
+
+const MAX_TUNNEL_RECOVERY_ATTEMPTS = 3;
+const TUNNEL_RETRY_BACKOFF_MS = 400;
+
+/**
+ * Prepares a one-shot tunnel and opens its CONNECT stream, attempting
+ * automatic inbound/outbound/SSH recovery if the proxy reports the box
+ * is unreachable.
+ */
+export async function openTunnelWithRecovery(
+  restClient: BoxliteRestSshClient,
+  restUrl: string,
+  apiKey: string,
+  boxId: string,
+  port: number,
+  isCancelled: () => boolean,
+  onLog?: (message: string) => void
+): Promise<net.Socket | undefined> {
+  for (let attempt = 1; attempt <= MAX_TUNNEL_RECOVERY_ATTEMPTS; attempt++) {
+    if (isCancelled()) {
+      return undefined;
+    }
+
+    const descriptor = await restClient.prepareTunnel(restUrl, apiKey, boxId, port, true);
+    if (isCancelled()) {
+      return undefined;
+    }
+
+    try {
+      return await restClient.openTunnelStream(descriptor.uri, apiKey);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isUnreachable = /box unreachable|guest tunnel unavailable/i.test(msg);
+      if (!isUnreachable || attempt >= MAX_TUNNEL_RECOVERY_ATTEMPTS || isCancelled()) {
+        throw err;
+      }
+
+      onLog?.(
+        `Tunnel to ${boxId}:${port} returned "${msg}"; verifying network and guest SSH state before retrying (attempt ${attempt}/${MAX_TUNNEL_RECOVERY_ATTEMPTS})...`
+      );
+      await restClient.enableInbound(restUrl, apiKey, boxId).catch(() => {});
+      await restClient.ensureTunnelReachable(restUrl, apiKey, boxId, onLog);
+      const st = await restClient.getSshStatus(restUrl, apiKey, boxId).catch(() => undefined);
+      if (st && !st.enabled && st.generation > 0) {
+        await restClient.enableSsh(restUrl, apiKey, boxId).catch(() => {});
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, TUNNEL_RETRY_BACKOFF_MS));
+    }
+  }
+  return undefined;
 }

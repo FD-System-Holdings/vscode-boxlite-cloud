@@ -1,5 +1,5 @@
 import * as net from 'net';
-import { BoxliteRestSshClient } from './restClient';
+import { BoxliteRestSshClient, openTunnelWithRecovery } from './restClient';
 
 export interface CredentialsSupplier {
   (): Promise<{ restUrl: string; apiKey: string }>;
@@ -21,7 +21,8 @@ export class LocalSshForwarder {
     public readonly targetPort: number,
     private readonly restClient: BoxliteRestSshClient,
     private readonly getCredentials: CredentialsSupplier,
-    private readonly onLog?: (message: string) => void
+    private readonly onLog?: (message: string) => void,
+    private readonly onError?: (boxId: string, err: unknown) => void
   ) {}
 
   public getPort(): number | undefined {
@@ -103,20 +104,19 @@ export class LocalSshForwarder {
 
     try {
       const { restUrl, apiKey } = await this.getCredentials();
-      const descriptor = await this.restClient.prepareTunnel(
+      tunnelSocket = await openTunnelWithRecovery(
+        this.restClient,
         restUrl,
         apiKey,
         this.boxId,
         this.targetPort,
-        true
+        () => this.closed || clientSocket.destroyed,
+        this.onLog
       );
-      if (this.closed || clientSocket.destroyed) {
-        return;
-      }
-
-      tunnelSocket = await this.restClient.openTunnelStream(descriptor.uri, apiKey);
-      if (this.closed || clientSocket.destroyed) {
-        tunnelSocket.destroy();
+      if (!tunnelSocket || this.closed || clientSocket.destroyed) {
+        if (tunnelSocket && !tunnelSocket.destroyed) {
+          tunnelSocket.destroy();
+        }
         return;
       }
 
@@ -135,6 +135,7 @@ export class LocalSshForwarder {
       tunnelSocket.resume();
     } catch (err: any) {
       this.onLog?.(`Failed to establish SSH tunnel for ${this.boxId}: ${err?.message || err}`);
+      this.onError?.(this.boxId, err);
       cleanup();
     }
   }
@@ -170,7 +171,8 @@ export class LocalForwarderManager {
   constructor(
     private readonly restClient: BoxliteRestSshClient,
     private readonly getCredentials: CredentialsSupplier,
-    private readonly onLog?: (message: string) => void
+    private readonly onLog?: (message: string) => void,
+    private readonly onError?: (boxId: string, err: unknown) => void
   ) {}
 
   public async ensureForwarder(boxId: string, targetPort = 22): Promise<{ host: string; port: number }> {
@@ -185,7 +187,8 @@ export class LocalForwarderManager {
       targetPort,
       this.restClient,
       this.getCredentials,
-      this.onLog
+      this.onLog,
+      this.onError
     );
     this.forwarders.set(key, forwarder);
     return forwarder.start();

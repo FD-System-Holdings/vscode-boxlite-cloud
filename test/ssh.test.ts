@@ -1,10 +1,12 @@
 import * as assert from 'assert';
 import { execFileSync, spawn } from 'child_process';
+import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import * as tls from 'tls';
 import * as vscode from 'vscode';
 import { registerCommands } from '../src/commands';
 import {
@@ -24,6 +26,7 @@ import {
   LocalForwarderManager,
   LocalTunnelBroker,
   parseCapabilitiesFromHelp,
+  parseListenPort,
   parseSetupOutput,
   parseStatusOutput,
   publicKeysMatch,
@@ -1562,6 +1565,616 @@ describe('Cloud SSH Access', () => {
         (vscode.commands as any).executeCommand = origExecCmd;
         (vscode.window as any).showInformationMessage = origShowInfo;
         (vscode.window as any).showWarningMessage = origShowWarn;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('sends Content-Length: 0 on bodyless POSTs, explicit :443/:80 CONNECT authority, fails fast on Content-Length refusals, and surfaces forwarder errors', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-tunnel-reg-'));
+      const serverSockets = new Set<net.Socket>();
+      const postContentLengths: Array<{ url: string; contentLength: string | undefined }> = [];
+      let tunnelShouldReject = false;
+
+      const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+          const urlPath = req.url || '/';
+          if (req.method === 'POST') {
+            postContentLengths.push({
+              url: urlPath,
+              contentLength: req.headers['content-length']
+            });
+          }
+
+          if (req.method === 'PUT' && urlPath === '/v1/boxes/box_err/network/inbound') {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+
+          if (req.method === 'POST' && urlPath === '/v1/boxes/box_err/ssh') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                enabled: true,
+                generation: 1,
+                listen_address: '0.0.0.0:22',
+                host_public_key: '',
+                host_key_fingerprint: 'SHA256:MockFP'
+              })
+            );
+            return;
+          }
+
+          if (req.method === 'POST' && urlPath === '/v1/boxes/box_err/ssh/enable') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ enabled: true, generation: 1, listen_address: '0.0.0.0:22' }));
+            return;
+          }
+
+          if (req.method === 'POST' && urlPath === '/v1/boxes/box_err/network/tunnel?port=22') {
+            const port = (server.address() as net.AddressInfo).port;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ uri: `http://127.0.0.1:${port}`, isPublic: true, token: null }));
+            return;
+          }
+
+          res.writeHead(404);
+          res.end();
+        });
+      });
+
+      server.on('connection', (sock) => {
+        serverSockets.add(sock);
+        sock.once('close', () => serverSockets.delete(sock));
+      });
+
+      server.on('connect', (_req, clientSocket) => {
+        serverSockets.add(clientSocket as net.Socket);
+        clientSocket.once('close', () => serverSockets.delete(clientSocket as net.Socket));
+        if (tunnelShouldReject) {
+          const body = 'box is stopped and auto-resume is disabled\n';
+          // Deliberately keep clientSocket open (HTTP/1.1 keep-alive without Connection: close)
+          clientSocket.write(
+            `HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`
+          );
+          return;
+        }
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+      const serverPort = (server.address() as net.AddressInfo).port;
+      const restUrl = `http://127.0.0.1:${serverPort}`;
+      const restClient = new BoxliteRestSshClient();
+
+      const origNetConnect = net.connect;
+      const origTlsConnect = tls.connect;
+      const origShowInfo = vscode.window.showInformationMessage;
+      const origShowWarn = vscode.window.showWarningMessage;
+      const origShowErr = vscode.window.showErrorMessage;
+      const origCreateTerminal = vscode.window.createTerminal;
+      const origGetConfig = vscode.workspace.getConfiguration;
+
+      try {
+        // 1. Bodyless POST requests include Content-Length: 0
+        await restClient.prepareTunnel(restUrl, 'blk_live_ok', 'box_err', 22, true);
+        await restClient.enableSsh(restUrl, 'blk_live_ok', 'box_err');
+        assert.deepStrictEqual(postContentLengths, [
+          { url: '/v1/boxes/box_err/network/tunnel?port=22', contentLength: '0' },
+          { url: '/v1/boxes/box_err/ssh/enable', contentLength: '0' }
+        ]);
+
+        // 2. openTunnelStream includes explicit :443 for https:// and :80 for http://localhost without explicit port
+        const capturedConnects: Array<{ port: number; rawReq: string }> = [];
+        const createStubSocket = (event: string, port: number) => {
+          const emitter = new EventEmitter() as any;
+          emitter.destroyed = false;
+          emitter.pause = () => emitter;
+          emitter.resume = () => emitter;
+          emitter.unshift = () => {};
+          emitter.destroy = () => {
+            emitter.destroyed = true;
+          };
+          emitter.write = (data: string | Buffer) => {
+            capturedConnects.push({ port, rawReq: data.toString() });
+            queueMicrotask(() => emitter.emit('data', Buffer.from('HTTP/1.1 200 Connection Established\r\n\r\n')));
+            return true;
+          };
+          queueMicrotask(() => emitter.emit(event));
+          return emitter;
+        };
+
+        (tls as any).connect = (opts: any) => createStubSocket('secureConnect', opts.port);
+        (net as any).connect = (opts: any) => createStubSocket('connect', opts.port);
+
+        const httpsSock = await restClient.openTunnelStream('https://22-d-test.proxy.boxlite.ai', 'blk_live_ok');
+        httpsSock.destroy();
+        const httpSock = await restClient.openTunnelStream('http://localhost', 'blk_live_ok');
+        httpSock.destroy();
+
+        (tls as any).connect = origTlsConnect;
+        (net as any).connect = origNetConnect;
+
+        assert.strictEqual(capturedConnects[0].port, 443);
+        assert.ok(capturedConnects[0].rawReq.startsWith('CONNECT 22-d-test.proxy.boxlite.ai:443 HTTP/1.1\r\n'));
+        assert.ok(capturedConnects[0].rawReq.includes('Host: 22-d-test.proxy.boxlite.ai:443\r\n'));
+
+        assert.strictEqual(capturedConnects[1].port, 80);
+        assert.ok(capturedConnects[1].rawReq.startsWith('CONNECT localhost:80 HTTP/1.1\r\n'));
+        assert.ok(capturedConnects[1].rawReq.includes('Host: localhost:80\r\n'));
+
+        // 3. Keep-alive 503 refusal with Content-Length fails fast (< 500ms) instead of hitting 2s timer
+        tunnelShouldReject = true;
+        const t0 = Date.now();
+        await assert.rejects(
+          () => restClient.openTunnelStream(restUrl, 'blk_live_ok'),
+          /box is stopped and auto-resume is disabled/
+        );
+        const elapsedMs = Date.now() - t0;
+        assert.ok(elapsedMs < 500, `Expected immediate refusal resolution via Content-Length, took ${elapsedMs}ms`);
+
+        // 4. LocalForwarderManager invokes onError and SshService reveals output + surfaces error toast
+        const fwdErrors: Array<{ boxId: string; msg: string }> = [];
+        const fwdMgr = new LocalForwarderManager(
+          restClient,
+          async () => ({ restUrl, apiKey: 'blk_live_ok' }),
+          undefined,
+          (bId, err) => fwdErrors.push({ boxId: bId, msg: err instanceof Error ? err.message : String(err) })
+        );
+        const { port: fwdPort } = await fwdMgr.ensureForwarder('box_err', 22);
+        await new Promise<void>((resolve) => {
+          const client = net.connect(fwdPort, '127.0.0.1');
+          client.once('close', () => resolve());
+          client.once('error', () => resolve());
+        });
+        assert.strictEqual(fwdErrors.length, 1);
+        assert.strictEqual(fwdErrors[0].boxId, 'box_err');
+        assert.ok(fwdErrors[0].msg.includes('box is stopped and auto-resume is disabled'));
+        await fwdMgr.dispose();
+
+        // Now verify SshService wiring shows output channel and error message on forwarder failure
+        const outputLines: string[] = [];
+        let outputShownCount = 0;
+        const errorToasts: string[] = [];
+        const createdTerminals: any[] = [];
+
+        (vscode.workspace as any).getConfiguration = () => ({
+          get: (_k: string, def: any) => def,
+          update: async () => {}
+        });
+        (vscode.window as any).showInformationMessage = async (_msg: string, ...items: any[]) =>
+          items.find((i) => typeof i === 'string');
+        (vscode.window as any).showWarningMessage = async (_msg: string, ...items: any[]) =>
+          items.find((i) => typeof i === 'string');
+        (vscode.window as any).showErrorMessage = async (msg: string) => {
+          errorToasts.push(msg);
+          return undefined;
+        };
+        (vscode.window as any).terminals = createdTerminals;
+        (vscode.window as any).createTerminal = (opts: any) => {
+          const term = {
+            name: opts.name,
+            creationOptions: opts,
+            show: () => {},
+            dispose: () => {
+              const idx = createdTerminals.indexOf(term);
+              if (idx >= 0) createdTerminals.splice(idx, 1);
+            }
+          };
+          createdTerminals.push(term);
+          return term;
+        };
+
+        const gsMap = new Map<string, unknown>();
+        const mockCtx = {
+          subscriptions: [],
+          extensionPath: repoRoot,
+          globalState: {
+            get: (k: string) => gsMap.get(k),
+            update: async (k: string, v: unknown) => {
+              gsMap.set(k, v);
+            }
+          },
+          globalStorageUri: { fsPath: tmpDir }
+        } as unknown as vscode.ExtensionContext;
+
+        const okOpenSshRunner: CliRunner = {
+          execFile: async (_bin, args) => {
+            if (args.includes('-V')) return { stdout: '', stderr: 'OpenSSH_9.5p2', exitCode: 0 };
+            return { stdout: '', stderr: '', exitCode: 0 };
+          }
+        };
+
+        const svc = new SshService(
+          mockCtx,
+          { listBoxes: async () => [{ id: 'box_err', name: 'err-box', status: 'running' }] } as any,
+          {
+            getApiKey: async () => 'blk_live_ok',
+            getActiveKey: async () => ({ id: 'k1', name: 'Default' }),
+            getRestUrl: () => restUrl
+          } as any,
+          {
+            appendLine: (line: string) => outputLines.push(line),
+            show: () => {
+              outputShownCount++;
+            }
+          } as any,
+          undefined,
+          new BoxliteSshCli(okOpenSshRunner),
+          new SshStore(mockCtx, (p) => fs.existsSync(p)),
+          new SshConfigFileManager(path.join(tmpDir, 'cfg_err')),
+          okOpenSshRunner,
+          restClient
+        );
+
+        await svc.connect('box_err', 'err-box');
+        assert.strictEqual(createdTerminals.length, 1);
+        const shellArgs: string[] = createdTerminals[0].creationOptions.shellArgs;
+        const pIdx = shellArgs.indexOf('-p');
+        const svcFwdPort = Number(shellArgs[pIdx + 1]);
+        assert.ok(svcFwdPort > 0);
+
+        await new Promise<void>((resolve) => {
+          const client = net.connect(svcFwdPort, '127.0.0.1');
+          client.once('close', () => resolve());
+          client.once('error', () => resolve());
+        });
+        // Wait one tick for async catch callback
+        await new Promise((r) => setTimeout(r, 20));
+
+        assert.ok(outputShownCount >= 1, 'Expected SSH output channel to be revealed on forwarder failure');
+        assert.ok(
+          outputLines.some((l) => l.includes('Failed to establish SSH tunnel for box_err')),
+          `Expected failure line in output channel, got: ${outputLines.join(' | ')}`
+        );
+        assert.ok(
+          errorToasts.some((m) => m.includes('SSH tunnel for "box_err" failed: box is stopped and auto-resume is disabled')),
+          `Expected error toast with tunnel detail, got: ${errorToasts.join(' | ')}`
+        );
+
+        await svc.tunnelBroker.dispose();
+        await svc.forwarderManager.dispose();
+        svc.dispose();
+      } finally {
+        (tls as any).connect = origTlsConnect;
+        (net as any).connect = origNetConnect;
+        (vscode.window as any).showInformationMessage = origShowInfo;
+        (vscode.window as any).showWarningMessage = origShowWarn;
+        (vscode.window as any).showErrorMessage = origShowErr;
+        (vscode.window as any).createTerminal = origCreateTerminal;
+        (vscode.workspace as any).getConfiguration = origGetConfig;
+        for (const s of serverSockets) {
+          try {
+            s.destroy();
+          } catch {}
+        }
+        serverSockets.clear();
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('parses guest listen_address ports cleanly with fallback to 22', () => {
+      assert.strictEqual(parseListenPort('0.0.0.0:22'), 22);
+      assert.strictEqual(parseListenPort('0.0.0.0:2222'), 2222);
+      assert.strictEqual(parseListenPort('[::]:2200'), 2200);
+      assert.strictEqual(parseListenPort('', 22), 22);
+      assert.strictEqual(parseListenPort('invalid-address', 22), 22);
+      assert.strictEqual(parseListenPort('0.0.0.0:99999', 22), 22);
+    });
+
+    it('auto-enables outbound network when disabled at runtime, fails fast when NIC is permanently absent, and recovers from transient 502 box unreachable', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-net-recovery-'));
+      const serverSockets = new Set<net.Socket>();
+      let outboundMode: 'enabled' | 'disabled' = 'disabled';
+      let outboundAllowNet: string[] = ['api.openai.com'];
+      let outboundUpdateRejectsPermanent = false;
+      let outboundPutPayloads: any[] = [];
+      let sshEnabled = false;
+      let sshGeneration = 0;
+      let unreachableRemaining = 0;
+      let connectAttempts = 0;
+
+      const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+          const urlPath = req.url || '/';
+          const bodyStr = Buffer.concat(chunks).toString('utf-8');
+
+          const matchBox = /^\/v1\/boxes\/([^/]+)$/.exec(urlPath);
+          if (req.method === 'GET' && matchBox) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                box_id: matchBox[1],
+                name: 'test-net-box',
+                status: 'running',
+                network: {
+                  inbound: { mode: 'enabled', allow_net: [] },
+                  outbound: { mode: outboundMode, allow_net: outboundAllowNet }
+                }
+              })
+            );
+            return;
+          }
+
+          if (req.method === 'PUT' && /^\/v1\/boxes\/[^/]+\/network\/inbound$/.test(urlPath)) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ mode: 'enabled' }));
+            return;
+          }
+
+          if (req.method === 'PUT' && /^\/v1\/boxes\/[^/]+\/network\/outbound$/.test(urlPath)) {
+            outboundPutPayloads.push(JSON.parse(bodyStr));
+            if (outboundUpdateRejectsPermanent) {
+              res.writeHead(501, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ message: 'box networking is disabled' }));
+              return;
+            }
+            outboundMode = 'enabled';
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ mode: 'enabled', allow_net: outboundAllowNet }));
+            return;
+          }
+
+          if (req.method === 'POST' && /^\/v1\/boxes\/[^/]+\/ssh$/.test(urlPath)) {
+            sshEnabled = true;
+            sshGeneration = 1;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                enabled: true,
+                generation: 1,
+                listen_address: '0.0.0.0:2222',
+                host_public_key: '',
+                host_key_fingerprint: 'SHA256:MockFP'
+              })
+            );
+            return;
+          }
+
+          if (req.method === 'GET' && /^\/v1\/boxes\/[^/]+\/ssh$/.test(urlPath)) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                enabled: sshEnabled,
+                generation: sshGeneration,
+                listen_address: sshEnabled ? '0.0.0.0:2222' : '',
+                host_public_key: '',
+                host_key_fingerprint: sshEnabled ? 'SHA256:MockFP' : ''
+              })
+            );
+            return;
+          }
+
+          if (req.method === 'POST' && /^\/v1\/boxes\/[^/]+\/ssh\/enable$/.test(urlPath)) {
+            sshEnabled = true;
+            sshGeneration = Math.max(1, sshGeneration);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                enabled: true,
+                generation: sshGeneration,
+                listen_address: '0.0.0.0:2222',
+                host_public_key: '',
+                host_key_fingerprint: 'SHA256:MockFP'
+              })
+            );
+            return;
+          }
+
+          if (req.method === 'POST' && /^\/v1\/boxes\/[^/]+\/network\/tunnel\?port=\d+$/.test(urlPath)) {
+            const port = (server.address() as net.AddressInfo).port;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ uri: `http://127.0.0.1:${port}`, isPublic: true, token: null }));
+            return;
+          }
+
+          res.writeHead(404);
+          res.end();
+        });
+      });
+
+      server.on('connection', (sock) => {
+        serverSockets.add(sock);
+        sock.once('close', () => serverSockets.delete(sock));
+      });
+      server.on('connect', (_req, clientSocket) => {
+        serverSockets.add(clientSocket as net.Socket);
+        clientSocket.once('close', () => serverSockets.delete(clientSocket as net.Socket));
+        connectAttempts++;
+        if (unreachableRemaining > 0) {
+          unreachableRemaining--;
+          const body = 'box unreachable\n';
+          clientSocket.write(
+            `HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`
+          );
+          return;
+        }
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\nSSH-2.0-Recovered\r\n');
+        clientSocket.on('data', (d) => clientSocket.write(d));
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+      const serverPort = (server.address() as net.AddressInfo).port;
+      const restUrl = `http://127.0.0.1:${serverPort}`;
+      const restClient = new BoxliteRestSshClient();
+
+      const origShowInfo = vscode.window.showInformationMessage;
+      const origShowWarn = vscode.window.showWarningMessage;
+      const origShowErr = vscode.window.showErrorMessage;
+      const origCreateTerminal = vscode.window.createTerminal;
+      const origGetConfig = vscode.workspace.getConfiguration;
+      const origExecCmd = vscode.commands.executeCommand;
+
+      try {
+        const createdTerminals: any[] = [];
+        const errorCalls: Array<{ msg: string; buttons: string[] }> = [];
+        const executedCmds: string[] = [];
+
+        (vscode.workspace as any).getConfiguration = () => ({
+          get: (_k: string, def: any) => def,
+          update: async () => {}
+        });
+        (vscode.window as any).showInformationMessage = async (_msg: string, ...items: any[]) =>
+          items.find((i) => typeof i === 'string');
+        (vscode.window as any).showWarningMessage = async (_msg: string, ...items: any[]) =>
+          items.find((i) => typeof i === 'string');
+        (vscode.window as any).showErrorMessage = async (msg: string, ...items: any[]) => {
+          const buttons = items.filter((i) => typeof i === 'string');
+          errorCalls.push({ msg, buttons });
+          return buttons[0];
+        };
+        (vscode.commands as any).executeCommand = async (id: string) => {
+          executedCmds.push(id);
+        };
+        (vscode.window as any).terminals = createdTerminals;
+        (vscode.window as any).createTerminal = (opts: any) => {
+          const term = {
+            name: opts.name,
+            creationOptions: opts,
+            show: () => {},
+            dispose: () => {
+              const idx = createdTerminals.indexOf(term);
+              if (idx >= 0) createdTerminals.splice(idx, 1);
+            }
+          };
+          createdTerminals.push(term);
+          return term;
+        };
+
+        const gsMap = new Map<string, unknown>();
+        const mockCtx = {
+          subscriptions: [],
+          extensionPath: repoRoot,
+          globalState: {
+            get: (k: string) => gsMap.get(k),
+            update: async (k: string, v: unknown) => {
+              gsMap.set(k, v);
+            }
+          },
+          globalStorageUri: { fsPath: tmpDir }
+        } as unknown as vscode.ExtensionContext;
+
+        const okOpenSshRunner: CliRunner = {
+          execFile: async (_bin, args) => {
+            if (args.includes('-V')) return { stdout: '', stderr: 'OpenSSH_9.5p2', exitCode: 0 };
+            return { stdout: '', stderr: '', exitCode: 0 };
+          }
+        };
+
+        const svc = new SshService(
+          mockCtx,
+          {
+            listBoxes: async () => [
+              { id: 'box_auto_out', name: 'auto-out-box', status: 'running' },
+              { id: 'box_no_nic', name: 'airgap-box', status: 'running' }
+            ]
+          } as any,
+          {
+            getApiKey: async () => 'blk_live_ok',
+            getActiveKey: async () => ({ id: 'k1', name: 'Default' }),
+            getRestUrl: () => restUrl
+          } as any,
+          { appendLine: () => {}, show: () => {} } as any,
+          undefined,
+          new BoxliteSshCli(okOpenSshRunner),
+          new SshStore(mockCtx, (p) => fs.existsSync(p)),
+          new SshConfigFileManager(path.join(tmpDir, 'cfg_net')),
+          okOpenSshRunner,
+          restClient
+        );
+
+        // 1. Auto-enables outbound network when disabled at runtime and preserves allow_net & custom port 2222
+        outboundMode = 'disabled';
+        outboundUpdateRejectsPermanent = false;
+        await svc.connect('box_auto_out', 'auto-out-box');
+        assert.strictEqual(outboundMode, 'enabled');
+        assert.deepStrictEqual(outboundPutPayloads, [{ mode: 'enabled', allow_net: ['api.openai.com'] }]);
+        assert.strictEqual(createdTerminals.length, 1);
+        assert.strictEqual(svc.store.get('vscode-k1', 'box_auto_out')?.targetPort, 2222);
+
+        // 2. Permanent no-NIC box fails fast with NETWORK_DISABLED and offers Create Box with Options...
+        createdTerminals.length = 0;
+        outboundMode = 'disabled';
+        outboundUpdateRejectsPermanent = true;
+        await svc.connect('box_no_nic', 'airgap-box');
+        assert.strictEqual(createdTerminals.length, 0, 'Must not open terminal when guest NIC is absent');
+        assert.ok(
+          errorCalls.some(
+            (e) =>
+              e.msg.includes('created with Outbound Network disabled') &&
+              e.buttons.includes('Create Box with Options...')
+          )
+        );
+        assert.ok(executedCmds.includes('boxlite.createBoxWithOptions'));
+
+        // 3. LocalForwarderManager recovers from transient 502 box unreachable by enabling outbound/SSH and retrying
+        outboundMode = 'disabled';
+        outboundUpdateRejectsPermanent = false;
+        sshEnabled = false;
+        sshGeneration = 1;
+        unreachableRemaining = 1;
+        connectAttempts = 0;
+
+        const fwdMgr = new LocalForwarderManager(restClient, async () => ({
+          restUrl,
+          apiKey: 'blk_live_ok'
+        }));
+        const { port: fwdPort } = await fwdMgr.ensureForwarder('box_auto_out', 2222);
+        const received = await new Promise<string>((resolve, reject) => {
+          const client = net.connect(fwdPort, '127.0.0.1');
+          let out = '';
+          const timer = setTimeout(() => {
+            client.destroy();
+            reject(new Error(`Timed out waiting for recovered tunnel stream; received=${out}`));
+          }, 5000);
+          client.on('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+          client.on('data', (chunk) => {
+            out += chunk.toString('utf-8');
+            if (out.includes('SSH-2.0-Recovered\r\n') && !out.includes('RECOVER-OK\n')) {
+              client.write('RECOVER-OK\n');
+            }
+            if (out.includes('RECOVER-OK\n')) {
+              clearTimeout(timer);
+              client.destroy();
+              resolve(out);
+            }
+          });
+        });
+
+        assert.strictEqual(connectAttempts, 2);
+        assert.strictEqual(outboundMode, 'enabled');
+        assert.strictEqual(sshEnabled, true);
+        assert.ok(received.includes('SSH-2.0-Recovered\r\n'));
+        assert.ok(received.includes('RECOVER-OK\n'));
+
+        await fwdMgr.dispose();
+        await svc.tunnelBroker.dispose();
+        await svc.forwarderManager.dispose();
+        svc.dispose();
+      } finally {
+        (vscode.window as any).showInformationMessage = origShowInfo;
+        (vscode.window as any).showWarningMessage = origShowWarn;
+        (vscode.window as any).showErrorMessage = origShowErr;
+        (vscode.window as any).createTerminal = origCreateTerminal;
+        (vscode.workspace as any).getConfiguration = origGetConfig;
+        (vscode.commands as any).executeCommand = origExecCmd;
+        for (const s of serverSockets) {
+          try {
+            s.destroy();
+          } catch {}
+        }
+        serverSockets.clear();
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     });
