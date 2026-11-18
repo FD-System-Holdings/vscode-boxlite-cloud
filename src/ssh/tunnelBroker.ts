@@ -160,25 +160,61 @@ export class LocalTunnelBroker {
   ): Promise<{ boxId: string; port: number; leftover: Buffer }> {
     return new Promise((resolve, reject) => {
       let buf = Buffer.alloc(0);
-      const timer = setTimeout(() => {
+      let settled = false;
+
+      const cleanupListeners = () => {
+        clearTimeout(timer);
         socket.removeListener('data', onData);
-        reject(new Error('Broker handshake timed out.'));
+        socket.removeListener('close', onClose);
+        socket.removeListener('error', onError);
+      };
+
+      const fail = (err: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanupListeners();
+        reject(err);
+      };
+
+      const succeed = (result: { boxId: string; port: number; leftover: Buffer }) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        cleanupListeners();
+        resolve(result);
+      };
+
+      const timer = setTimeout(() => {
+        fail(new Error('Broker handshake timed out.'));
       }, 10_000);
 
+      const onClose = () => {
+        fail(new Error('Broker client disconnected before completing handshake.'));
+      };
+
+      const onError = (err: Error) => {
+        fail(err);
+      };
+
       const onData = (chunk: Buffer) => {
-        buf = Buffer.concat([buf, chunk]);
-        const nlIdx = buf.indexOf(0x0a);
-        if (nlIdx === -1) {
-          if (buf.length > MAX_HANDSHAKE_BYTES) {
-            clearTimeout(timer);
-            socket.removeListener('data', onData);
-            reject(new Error('Broker handshake line too large.'));
-          }
+        const nlInChunk = chunk.indexOf(0x0a);
+        if (
+          (nlInChunk === -1 && buf.length + chunk.length > MAX_HANDSHAKE_BYTES) ||
+          (nlInChunk !== -1 && buf.length + nlInChunk > MAX_HANDSHAKE_BYTES)
+        ) {
+          fail(new Error('Broker handshake line too large.'));
           return;
         }
 
-        clearTimeout(timer);
-        socket.removeListener('data', onData);
+        buf = Buffer.concat([buf, chunk]);
+        const nlIdx = buf.indexOf(0x0a);
+        if (nlIdx === -1) {
+          return;
+        }
+
         socket.pause();
 
         const line = buf.subarray(0, nlIdx).toString('utf-8').trim();
@@ -186,29 +222,31 @@ export class LocalTunnelBroker {
 
         try {
           const req = JSON.parse(line) as { secret?: string; boxId?: string; port?: number };
-          const suppliedBuf = Buffer.from(String(req.secret || ''), 'utf-8');
+          const suppliedBuf = Buffer.from(String(req?.secret || ''), 'utf-8');
           const expectedBuf = Buffer.from(expectedSecret, 'utf-8');
           if (
             suppliedBuf.length !== expectedBuf.length ||
             !crypto.timingSafeEqual(suppliedBuf, expectedBuf)
           ) {
-            reject(new Error('Unauthorized tunnel broker client.'));
+            fail(new Error('Unauthorized tunnel broker client.'));
             return;
           }
 
-          const boxId = validateBoxId(String(req.boxId || ''));
-          const port = Number(req.port ?? 22);
+          const boxId = validateBoxId(String(req?.boxId || ''));
+          const port = Number(req?.port ?? 22);
           if (!Number.isInteger(port) || port < 1 || port > 65535) {
-            reject(new Error(`Invalid target port: ${req.port}`));
+            fail(new Error(`Invalid target port: ${req?.port}`));
             return;
           }
-          resolve({ boxId, port, leftover });
+          succeed({ boxId, port, leftover });
         } catch (err) {
-          reject(err);
+          fail(err);
         }
       };
 
       socket.on('data', onData);
+      socket.once('close', onClose);
+      socket.once('error', onError);
     });
   }
 
@@ -221,13 +259,18 @@ export class LocalTunnelBroker {
     this.activeSockets.clear();
 
     const srv = this.server;
+    const expectedSecret = this.secret;
     this.server = undefined;
     this.secret = undefined;
     this.boundPort = undefined;
 
     if (fs.existsSync(this.descriptorPath)) {
       try {
-        fs.unlinkSync(this.descriptorPath);
+        const raw = fs.readFileSync(this.descriptorPath, 'utf-8');
+        const parsed = JSON.parse(raw) as Partial<BrokerDescriptor>;
+        if (parsed.pid === process.pid && expectedSecret && parsed.secret === expectedSecret) {
+          fs.unlinkSync(this.descriptorPath);
+        }
       } catch {}
     }
 

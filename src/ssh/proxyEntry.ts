@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as net from 'net';
 import { validateBoxId } from './parse';
-import { BoxliteRestSshClient } from './restClient';
+import { assertValidPort, BoxliteRestSshClient } from './restClient';
 import { BrokerDescriptor } from './tunnelBroker';
 
 interface ProxyCliArgs {
@@ -32,7 +32,7 @@ function parseArgs(argv: string[]): ProxyCliArgs {
 
   return {
     boxId: validateBoxId(boxId),
-    port,
+    port: assertValidPort(port),
     brokerPath,
     restUrl
   };

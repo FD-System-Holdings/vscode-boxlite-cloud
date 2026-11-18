@@ -69,7 +69,17 @@ export function sanitizeAlias(
   return `${withShortId}-${counter}`;
 }
 
+function assertSafeConfigValue(fieldName: string, value: string, allowWhitespace = true): void {
+  if (/[\r\n\0]/.test(value)) {
+    throw new Error(`Invalid SSH config ${fieldName}: control characters or newlines are not allowed.`);
+  }
+  if (!allowWhitespace && /\s/.test(value)) {
+    throw new Error(`Invalid SSH config ${fieldName}: whitespace is not allowed.`);
+  }
+}
+
 function formatConfigPathValue(filePath: string): string {
+  assertSafeConfigValue('path', filePath);
   if (/[\s"'#]/.test(filePath)) {
     return `"${filePath.replace(/"/g, '\\"')}"`;
   }
@@ -77,11 +87,38 @@ function formatConfigPathValue(filePath: string): string {
 }
 
 export function formatManagedBlock(spec: SshHostBlockSpec, eol = '\n'): string {
+  const user = spec.user || 'box';
+  assertSafeConfigValue('boxId', spec.boxId, false);
+  assertSafeConfigValue('alias', spec.alias, false);
+  assertSafeConfigValue('hostName', spec.hostName, false);
+  assertSafeConfigValue('user', user, false);
+  assertSafeConfigValue('identityFile', spec.identityFile);
+
+  if (spec.port !== undefined && spec.port !== '') {
+    assertSafeConfigValue('port', spec.port, false);
+    const portNum = Number(spec.port);
+    if (!/^\d+$/.test(spec.port) || portNum < 1 || portNum > 65535) {
+      throw new Error(`Invalid SSH config port: "${spec.port}".`);
+    }
+  }
+  if (spec.userKnownHostsFile) {
+    assertSafeConfigValue('userKnownHostsFile', spec.userKnownHostsFile);
+  }
+  if (spec.hostKeyAlias) {
+    assertSafeConfigValue('hostKeyAlias', spec.hostKeyAlias, false);
+  }
+  if (spec.strictHostKeyChecking) {
+    assertSafeConfigValue('strictHostKeyChecking', spec.strictHostKeyChecking, false);
+  }
+  if (spec.proxyCommand) {
+    assertSafeConfigValue('proxyCommand', spec.proxyCommand);
+  }
+
   const lines = [
     `${START_MARKER_PREFIX}${spec.boxId}${START_MARKER_SUFFIX}`,
     `Host ${spec.alias}`,
     `  HostName ${spec.hostName}`,
-    `  User ${spec.user || 'box'}`,
+    `  User ${user}`,
     `  IdentityFile ${formatConfigPathValue(spec.identityFile)}`,
     '  IdentitiesOnly yes'
   ];

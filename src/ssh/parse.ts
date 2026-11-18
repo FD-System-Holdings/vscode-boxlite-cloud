@@ -522,7 +522,7 @@ export function shellEscapeArg(arg: string, platform: NodeJS.Platform = process.
     return arg;
   }
   if (platform === 'win32') {
-    const escaped = arg.replace(/"/g, '\\"');
+    const escaped = arg.replace(/"/g, '""');
     return `"${escaped}"`;
   }
   return `'${arg.replace(/'/g, `'\\''`)}'`;

@@ -8,6 +8,9 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { registerCommands } from '../src/commands';
 import {
+  assertSafeApiKey,
+  assertSecureUrl,
+  assertValidPort,
   BoxliteRestSshClient,
   BoxliteSshCli,
   buildCliContextName,
@@ -15,6 +18,8 @@ import {
   CliRunner,
   ensureBoxKeyBundle,
   ExecResult,
+  formatManagedBlock,
+  formatShellCommand,
   generateEd25519KeyPair,
   LocalForwarderManager,
   LocalTunnelBroker,
@@ -26,6 +31,7 @@ import {
   removeAllManagedBlocks,
   removeBlock,
   sanitizeAlias,
+  shellEscapeArg,
   SshCliError,
   SshConfigFileManager,
   SshService,
@@ -1171,6 +1177,391 @@ describe('Cloud SSH Access', () => {
         serverSockets.clear();
         apiServer.closeAllConnections?.();
         await new Promise<void>((r) => apiServer.close(() => r()));
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('Security Hardening & Regression Checks', () => {
+    it('rejects non-loopback http:// URLs while allowing https:// and loopback http://', async () => {
+      assert.strictEqual(assertSecureUrl('https://api.boxlite.ai/v1').protocol, 'https:');
+      assert.strictEqual(assertSecureUrl('http://127.0.0.1:8080').hostname, '127.0.0.1');
+      assert.strictEqual(assertSecureUrl('http://localhost:3000').hostname, 'localhost');
+      assert.strictEqual(assertSecureUrl('http://[::1]:3000').hostname, '[::1]');
+
+      assert.throws(() => assertSecureUrl('http://api.boxlite.ai/v1'), /Insecure http:\/\/ URL/);
+      assert.throws(() => assertSecureUrl('http://10.0.0.5:8080'), /Insecure http:\/\/ URL/);
+      assert.throws(() => assertSecureUrl('ftp://api.boxlite.ai'), /Unsupported URL protocol/);
+
+      const client = new BoxliteRestSshClient();
+      await assert.rejects(
+        () => client.getSshStatus('http://api.boxlite.ai', 'blk_live_abc', 'box_1'),
+        /Insecure http:\/\/ URL/
+      );
+      await assert.rejects(
+        () => client.openTunnelStream('http://tunnel.boxlite.ai:443', 'blk_live_abc'),
+        /Insecure http:\/\/ URL/
+      );
+    });
+
+    it('rejects API keys containing CR/LF/NUL control characters', async () => {
+      assert.strictEqual(assertSafeApiKey('  blk_live_ok  '), 'blk_live_ok');
+      assert.throws(() => assertSafeApiKey('blk_live_a\r\nX-Injected: 1'), /control characters/i);
+      assert.throws(() => assertSafeApiKey('blk_live_a\n'), /control characters/i);
+      assert.throws(() => assertSafeApiKey('blk_live_a\0'), /control characters/i);
+
+      const client = new BoxliteRestSshClient();
+      await assert.rejects(
+        () => client.openTunnelStream('https://127.0.0.1:1', 'blk_live_a\r\nEvil: 1'),
+        (err: any) => err instanceof SshCliError && err.code === 'AUTH_FAILED'
+      );
+    });
+
+    it('validates port numbers in restClient and bundled ssh-proxy.js', async () => {
+      assert.strictEqual(assertValidPort(22), 22);
+      assert.strictEqual(assertValidPort(65535), 65535);
+      for (const badPort of [0, -1, 65536, 22.5, Number.NaN]) {
+        assert.throws(() => assertValidPort(badPort), /Invalid target port/);
+      }
+
+      const client = new BoxliteRestSshClient();
+      await assert.rejects(
+        () => client.prepareTunnel('https://api.boxlite.ai', 'blk_live_ok', 'box_1', 70000),
+        /Invalid target port/
+      );
+      await assert.rejects(
+        () => client.revokeTunnel('https://api.boxlite.ai', 'blk_live_ok', 'box_1', Number.NaN),
+        /Invalid target port/
+      );
+
+      const proxyBundlePath = path.join(repoRoot, 'dist', 'ssh-proxy.js');
+      if (fs.existsSync(proxyBundlePath)) {
+        const res = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+          const child = spawn(process.execPath, [proxyBundlePath, '--box', 'box_1', '--port', '99999'], {
+            stdio: ['ignore', 'ignore', 'pipe']
+          });
+          let stderr = '';
+          child.stderr.on('data', (d) => (stderr += d.toString('utf-8')));
+          child.on('close', (code) => resolve({ code, stderr }));
+        });
+        assert.notStrictEqual(res.code, 0);
+        assert.ok(res.stderr.includes('Invalid target port'));
+      }
+    });
+
+    it('rejects newline and whitespace injection in formatManagedBlock', () => {
+      const baseSpec = {
+        boxId: 'box_1',
+        alias: 'boxlite-dev',
+        hostName: '127.0.0.1',
+        user: 'box',
+        identityFile: '/tmp/key'
+      };
+      assert.ok(formatManagedBlock(baseSpec).includes('Host boxlite-dev'));
+
+      assert.throws(
+        () =>
+          formatManagedBlock({
+            ...baseSpec,
+            proxyCommand: 'boxlite tunnel\nPermitLocalCommand yes\nLocalCommand calc.exe'
+          }),
+        /control characters or newlines/
+      );
+      assert.throws(() => formatManagedBlock({ ...baseSpec, user: 'box\r\nRemoteCommand evil' }), /newlines/);
+      assert.throws(() => formatManagedBlock({ ...baseSpec, hostName: '0.0.0.0\nInclude /tmp/x' }), /newlines/);
+      assert.throws(() => formatManagedBlock({ ...baseSpec, identityFile: '/tmp/k\nMatch all' }), /newlines/);
+      assert.throws(() => formatManagedBlock({ ...baseSpec, boxId: 'box_1\nHost *' }), /newlines/);
+      assert.throws(() => formatManagedBlock({ ...baseSpec, user: 'box evil' }), /whitespace/);
+      assert.throws(() => formatManagedBlock({ ...baseSpec, port: '99999' }), /Invalid SSH config port/);
+    });
+
+    it('uses Windows-safe doubled quotes in shellEscapeArg and escapes % in ProxyCommand', () => {
+      const escaped = shellEscapeArg('ProxyCommand=node.exe "C:\\Program Files\\ssh-proxy.js"', 'win32');
+      assert.strictEqual(escaped, '"ProxyCommand=node.exe ""C:\\Program Files\\ssh-proxy.js"""');
+      assert.strictEqual(escaped.includes('\\"'), false);
+
+      const cmd = formatShellCommand(
+        'ssh',
+        ['-i', 'C:\\Users\\Alice Smith\\key', '-o', 'ProxyCommand=node.exe "C:\\Program Files\\proxy.js"'],
+        'win32'
+      );
+      assert.ok(cmd.includes('""C:\\Program Files\\proxy.js""'));
+    });
+
+    it('protects broker descriptor across multi-window dispose, oversized handshakes, and wrong secrets', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-broker-sec-'));
+      try {
+        const brokerPath = path.join(tmpDir, 'ssh-broker.json');
+        const restClient = new BoxliteRestSshClient();
+        const broker = new LocalTunnelBroker(brokerPath, restClient, async () => ({
+          restUrl: 'http://127.0.0.1:1',
+          apiKey: 'blk_live_test'
+        }));
+        await broker.ensureStarted();
+        const info = JSON.parse(fs.readFileSync(brokerPath, 'utf-8'));
+
+        // Wrong secret must return ERR and close
+        const badSecretReply = await new Promise<string>((resolve, reject) => {
+          const sock = net.connect(info.port, '127.0.0.1');
+          let out = '';
+          sock.on('error', reject);
+          sock.on('connect', () => {
+            sock.write(`${JSON.stringify({ secret: 'wrong-secret', boxId: 'box_1', port: 22 })}\n`);
+          });
+          sock.on('data', (d) => (out += d.toString('utf-8')));
+          sock.on('close', () => resolve(out));
+        });
+        assert.ok(badSecretReply.startsWith('ERR Unauthorized tunnel broker client.'));
+
+        // Oversized handshake WITH trailing newline in one chunk must still be rejected
+        const oversizedReply = await new Promise<string>((resolve, reject) => {
+          const sock = net.connect(info.port, '127.0.0.1');
+          let out = '';
+          sock.on('error', reject);
+          sock.on('connect', () => {
+            const payload = `${'A'.repeat(5000)}\n`;
+            sock.write(payload);
+          });
+          sock.on('data', (d) => (out += d.toString('utf-8')));
+          sock.on('close', () => resolve(out));
+        });
+        assert.ok(oversizedReply.includes('ERR Broker handshake line too large.'));
+
+        // Simulate a second VS Code window overwriting ssh-broker.json before Window 1 disposes
+        const foreignDescriptor = { port: info.port + 1, secret: 'foreign-secret', pid: process.pid + 99999 };
+        fs.writeFileSync(brokerPath, JSON.stringify(foreignDescriptor), 'utf-8');
+        await broker.dispose();
+        assert.strictEqual(fs.existsSync(brokerPath), true, 'dispose() must not delete another window descriptor');
+        assert.deepStrictEqual(JSON.parse(fs.readFileSync(brokerPath, 'utf-8')), foreignDescriptor);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects openTunnelStream HTTP 403 refusal with AUTH_FAILED and detects host_public_key mismatch', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-sec-flow-'));
+      const serverSockets = new Set<net.Socket>();
+      let serverPort = 0;
+
+      const server = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+          if (req.method === 'PUT' && req.url === '/v1/boxes/box_mismatch/network/inbound') {
+            res.writeHead(204);
+            res.end();
+            return;
+          }
+          if (req.method === 'POST' && req.url === '/v1/boxes/box_mismatch/ssh') {
+            const wrongPair = generateEd25519KeyPair('wrong-host');
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                enabled: true,
+                generation: 1,
+                listen_address: '0.0.0.0:22',
+                host_public_key: wrongPair.publicKeyLine,
+                host_key_fingerprint: wrongPair.fingerprint
+              })
+            );
+            return;
+          }
+          res.writeHead(404);
+          res.end();
+        });
+      });
+
+      server.on('connection', (sock) => {
+        serverSockets.add(sock);
+        sock.once('close', () => serverSockets.delete(sock));
+      });
+      server.on('connect', (_req, clientSocket) => {
+        serverSockets.add(clientSocket as net.Socket);
+        clientSocket.once('close', () => serverSockets.delete(clientSocket as net.Socket));
+        clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n{"message":"bad token"}');
+      });
+
+      await new Promise<void>((resolve) => {
+        server.listen(0, '127.0.0.1', () => {
+          serverPort = (server.address() as net.AddressInfo).port;
+          resolve();
+        });
+      });
+
+      const origShowWarn = vscode.window.showWarningMessage;
+      const origShowErr = vscode.window.showErrorMessage;
+      try {
+        const restUrl = `http://127.0.0.1:${serverPort}`;
+        const restClient = new BoxliteRestSshClient();
+
+        // 1. 403 CONNECT refusal must map to AUTH_FAILED
+        await assert.rejects(
+          () => restClient.openTunnelStream(restUrl, 'blk_live_bad'),
+          (err: any) => err instanceof SshCliError && err.code === 'AUTH_FAILED'
+        );
+
+        // 2. Host key mismatch triggers warning modal and aborts when user declines reset
+        let warningShown = '';
+        (vscode.window as any).showWarningMessage = async (msg: string) => {
+          warningShown = msg;
+          return undefined; // User declines Reset SSH...
+        };
+        (vscode.window as any).showErrorMessage = async () => undefined;
+
+        const gsMap = new Map<string, unknown>();
+        const mockCtx = {
+          subscriptions: [],
+          extensionPath: repoRoot,
+          globalState: {
+            get: (k: string) => gsMap.get(k),
+            update: async (k: string, v: unknown) => {
+              gsMap.set(k, v);
+            }
+          },
+          globalStorageUri: { fsPath: tmpDir }
+        } as unknown as vscode.ExtensionContext;
+
+        const runner: CliRunner = {
+          execFile: async (_bin, args) => {
+            if (args.includes('-V')) {
+              return { stdout: '', stderr: 'OpenSSH_9.5p2', exitCode: 0 };
+            }
+            return { stdout: '', stderr: '', exitCode: 0 };
+          }
+        };
+
+        const svc = new SshService(
+          mockCtx,
+          { listBoxes: async () => [{ id: 'box_mismatch', name: 'mismatch-box', status: 'running' }] } as any,
+          {
+            getApiKey: async () => 'blk_live_ok',
+            getActiveKey: async () => ({ id: 'k1', name: 'Default' }),
+            getRestUrl: () => restUrl
+          } as any,
+          { appendLine: () => {}, show: () => {} } as any,
+          undefined,
+          new BoxliteSshCli(runner),
+          new SshStore(mockCtx, (p) => fs.existsSync(p)),
+          new SshConfigFileManager(path.join(tmpDir, 'ssh_cfg')),
+          runner,
+          restClient
+        );
+
+        await svc.connect('box_mismatch', 'mismatch-box');
+        assert.ok(warningShown.includes('does not match the extension-managed host key'));
+        assert.strictEqual((svc as any).activeTerminals.size, 0, 'Must not open SSH terminal on host key mismatch');
+        svc.dispose();
+      } finally {
+        (vscode.window as any).showWarningMessage = origShowWarn;
+        (vscode.window as any).showErrorMessage = origShowErr;
+        for (const s of serverSockets) {
+          try {
+            s.destroy();
+          } catch {}
+        }
+        serverSockets.clear();
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('preserves trustedAt when opening Remote-SSH in CLI mode', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-cli-trust-'));
+      const keyPath = path.join(tmpDir, 'id_ed25519');
+      fs.writeFileSync(keyPath, 'dummy-key', { mode: 0o600 });
+      const sshConfigPath = path.join(tmpDir, 'ssh_config');
+
+      const origGetConfig = vscode.workspace.getConfiguration;
+      const origGetExt = vscode.extensions.getExtension;
+      const origExecCmd = vscode.commands.executeCommand;
+      const origShowInfo = vscode.window.showInformationMessage;
+      const origShowWarn = vscode.window.showWarningMessage;
+
+      try {
+        (vscode.workspace as any).getConfiguration = (section?: string) => ({
+          get: <T>(key: string, def?: T) => {
+            if (section === 'boxlite' && key === 'ssh.mode') return 'cli';
+            if (section === 'boxlite' && key === 'ssh.manageConfig') return true;
+            return def;
+          },
+          update: async () => {}
+        });
+        (vscode.extensions as any).getExtension = (id: string) =>
+          id === 'ms-vscode-remote.remote-ssh' ? ({ id } as any) : undefined;
+        (vscode.commands as any).executeCommand = async () => {};
+        (vscode.window as any).showInformationMessage = async (_msg: string, ...items: any[]) =>
+          items.find((i) => typeof i === 'string');
+        (vscode.window as any).showWarningMessage = async (_msg: string, ...items: any[]) =>
+          items.find((i) => typeof i === 'string');
+
+        const gsMap = new Map<string, unknown>();
+        const mockCtx = {
+          subscriptions: [],
+          extensionPath: repoRoot,
+          globalState: {
+            get: (k: string) => gsMap.get(k),
+            update: async (k: string, v: unknown) => {
+              gsMap.set(k, v);
+            }
+          },
+          globalStorageUri: { fsPath: tmpDir }
+        } as unknown as vscode.ExtensionContext;
+
+        const runner: CliRunner = {
+          execFile: async (bin, args) => {
+            if (bin === 'boxlite' && args.includes('--version')) {
+              return { stdout: 'boxlite 0.10.5', stderr: '', exitCode: 0 };
+            }
+            if (bin === 'boxlite' && args.includes('ssh') && args.includes('--help')) {
+              return { stdout: 'Usage: boxlite ssh --json <BOX>', stderr: '', exitCode: 0 };
+            }
+            if (bin === 'ssh' && args.includes('-V')) {
+              return { stdout: '', stderr: 'OpenSSH_9.5p2', exitCode: 0 };
+            }
+            if (bin === 'boxlite' && args.includes('ssh')) {
+              return {
+                stdout: JSON.stringify({
+                  private_key_path: keyPath,
+                  fingerprint: 'SHA256:CliTrustFP',
+                  ssh_command: `ssh -i "${keyPath}" -o ProxyCommand="boxlite network tunnel --stdio box_cli 22" boxlite@0.0.0.0`
+                }),
+                stderr: '',
+                exitCode: 0
+              };
+            }
+            return { stdout: '', stderr: '', exitCode: 0 };
+          }
+        };
+
+        const store = new SshStore(mockCtx, (p) => fs.existsSync(p));
+        const svc = new SshService(
+          mockCtx,
+          { listBoxes: async () => [{ id: 'box_cli', name: 'cli-box', status: 'running' }] } as any,
+          {
+            getApiKey: async () => 'blk_live_ok',
+            getActiveKey: async () => ({ id: 'k1', name: 'Default' }),
+            getRestUrl: () => 'https://api.boxlite.ai'
+          } as any,
+          { appendLine: () => {}, show: () => {} } as any,
+          undefined,
+          new BoxliteSshCli(runner),
+          store,
+          new SshConfigFileManager(sshConfigPath),
+          runner
+        );
+
+        await svc.openRemote('box_cli', 'cli-box');
+        const saved = store.get('vscode-k1', 'box_cli');
+        assert.ok(saved?.trustedAt, 'trustedAt must remain set after openRemote in CLI mode');
+        assert.strictEqual(saved?.hostAlias, 'boxlite-cli-box');
+        svc.dispose();
+      } finally {
+        (vscode.workspace as any).getConfiguration = origGetConfig;
+        (vscode.extensions as any).getExtension = origGetExt;
+        (vscode.commands as any).executeCommand = origExecCmd;
+        (vscode.window as any).showInformationMessage = origShowInfo;
+        (vscode.window as any).showWarningMessage = origShowWarn;
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     });

@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { CredentialsManager } from '../auth/credentials';
@@ -142,7 +143,12 @@ export class SshService implements vscode.Disposable {
   }
 
   private getStorageRoot(): string {
-    return this.context.globalStorageUri?.fsPath || this.context.extensionPath || process.cwd();
+    if (this.context.globalStorageUri?.fsPath) {
+      return this.context.globalStorageUri.fsPath;
+    }
+    const fallbackDir = path.join(os.tmpdir(), 'boxlite-cloud-ssh');
+    fs.mkdirSync(fallbackDir, { recursive: true, mode: 0o700 });
+    return fallbackDir;
   }
 
   private getProxyScriptPath(): string {
@@ -196,7 +202,11 @@ export class SshService implements vscode.Disposable {
       '--url',
       restUrl
     ];
-    return `${shellEscapeArg(resolved.bin)} ${args.map((a) => shellEscapeArg(a)).join(' ')}`;
+    // OpenSSH expands % tokens inside ProxyCommand; double literal % to prevent token substitution.
+    const escapeOpenSshPercent = (s: string) => s.replace(/%/g, '%%');
+    return `${shellEscapeArg(escapeOpenSshPercent(resolved.bin))} ${args
+      .map((a) => shellEscapeArg(escapeOpenSshPercent(a)))
+      .join(' ')}`;
   }
 
   public async getActiveContextName(): Promise<string> {
@@ -603,6 +613,7 @@ export class SshService implements vscode.Disposable {
         return undefined;
       }
       await this.store.markTrusted(contextName, boxId);
+      stored.trustedAt = new Date().toISOString();
     }
 
     return stored;
@@ -689,6 +700,7 @@ export class SshService implements vscode.Disposable {
         return undefined;
       }
       await this.store.markTrusted(contextName, boxId);
+      stored.trustedAt = new Date().toISOString();
     }
 
     return stored;

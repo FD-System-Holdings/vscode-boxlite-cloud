@@ -46,6 +46,47 @@ const CONNECT_REFUSAL_MAX_BYTES = 512;
 const CONNECT_REFUSAL_TIMEOUT_MS = 2_000;
 const MAX_CONNECT_HEADER_BYTES = 16_384;
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+export function assertSecureUrl(rawUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new SshCliError('UNKNOWN', `Invalid URL: "${rawUrl}"`);
+  }
+  if (parsed.protocol === 'https:') {
+    return parsed;
+  }
+  if (parsed.protocol === 'http:') {
+    if (LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())) {
+      return parsed;
+    }
+    throw new SshCliError(
+      'UNKNOWN',
+      `Insecure http:// URL is only allowed for loopback hosts (127.0.0.1, localhost, ::1); use https:// instead ("${parsed.hostname}").`
+    );
+  }
+  throw new SshCliError('UNKNOWN', `Unsupported URL protocol: "${parsed.protocol}"`);
+}
+
+export function assertSafeApiKey(apiKey: string): string {
+  if (!apiKey || !apiKey.trim()) {
+    throw new SshCliError('AUTH_FAILED', 'No BoxLite Cloud API key is configured.');
+  }
+  if (/[\r\n\0]/.test(apiKey)) {
+    throw new SshCliError('AUTH_FAILED', 'Invalid BoxLite Cloud API key: control characters are not allowed.');
+  }
+  return apiKey.trim();
+}
+
+export function assertValidPort(port: number): number {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new SshCliError('UNKNOWN', `Invalid target port: ${port}. Expected an integer between 1 and 65535.`);
+  }
+  return port;
+}
+
 export class NodeRestHttpTransport implements RestHttpTransport {
   public request(
     method: string,
@@ -55,7 +96,7 @@ export class NodeRestHttpTransport implements RestHttpTransport {
     timeoutMs = DEFAULT_HTTP_TIMEOUT_MS
   ): Promise<{ statusCode: number; body: string }> {
     return new Promise((resolve, reject) => {
-      const parsed = new URL(url);
+      const parsed = assertSecureUrl(url);
       const isHttps = parsed.protocol === 'https:';
       const mod = isHttps ? https : http;
 
@@ -138,13 +179,11 @@ export class BoxliteRestSshClient {
     body?: unknown,
     timeoutMs = DEFAULT_HTTP_TIMEOUT_MS
   ): Promise<T> {
-    if (!apiKey || !apiKey.trim()) {
-      throw new SshCliError('AUTH_FAILED', 'No BoxLite Cloud API key is configured.');
-    }
-
+    const safeKey = assertSafeApiKey(apiKey);
     const url = this.buildV1Url(restUrl, subPath);
+    assertSecureUrl(url);
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${apiKey.trim()}`,
+      Authorization: `Bearer ${safeKey}`,
       Accept: 'application/json',
       'User-Agent': 'boxlite-cloud-vscode/0.3.0'
     };
@@ -223,19 +262,21 @@ export class BoxliteRestSshClient {
     isPublic = true
   ): Promise<TunnelDescriptorResponse> {
     const safeId = encodeURIComponent(validateBoxId(boxId));
+    const validPort = assertValidPort(port);
     const body = isPublic ? undefined : { isPublic: false };
     return this.requestJson<TunnelDescriptorResponse>(
       'POST',
       restUrl,
       apiKey,
-      `/boxes/${safeId}/network/tunnel?port=${port}`,
+      `/boxes/${safeId}/network/tunnel?port=${validPort}`,
       body
     );
   }
 
   public async revokeTunnel(restUrl: string, apiKey: string, boxId: string, port = 22): Promise<void> {
     const safeId = encodeURIComponent(validateBoxId(boxId));
-    await this.requestJson('DELETE', restUrl, apiKey, `/boxes/${safeId}/network/tunnel?port=${port}`);
+    const validPort = assertValidPort(port);
+    await this.requestJson('DELETE', restUrl, apiKey, `/boxes/${safeId}/network/tunnel?port=${validPort}`);
   }
 
   /**
@@ -247,22 +288,16 @@ export class BoxliteRestSshClient {
     apiKey: string,
     timeoutMs = DEFAULT_HTTP_TIMEOUT_MS
   ): Promise<net.Socket> {
-    if (!apiKey || !apiKey.trim()) {
-      return Promise.reject(new SshCliError('AUTH_FAILED', 'No BoxLite Cloud API key is configured.'));
-    }
-
+    let safeKey: string;
     let parsed: URL;
     try {
-      parsed = new URL(tunnelUri);
-    } catch {
-      return Promise.reject(new SshCliError('UNKNOWN', `Invalid tunnel URI: "${tunnelUri}"`));
+      safeKey = assertSafeApiKey(apiKey);
+      parsed = assertSecureUrl(tunnelUri);
+    } catch (err) {
+      return Promise.reject(err);
     }
 
     const isHttps = parsed.protocol === 'https:';
-    if (!isHttps && parsed.protocol !== 'http:') {
-      return Promise.reject(new SshCliError('UNKNOWN', `Unsupported tunnel URI protocol: "${parsed.protocol}"`));
-    }
-
     const port = parsed.port ? Number(parsed.port) : isHttps ? 443 : 80;
     const authority = parsed.host; // hostname or hostname:port
 
@@ -369,7 +404,7 @@ export class BoxliteRestSshClient {
         const reqLines = [
           `CONNECT ${authority} HTTP/1.1`,
           `Host: ${authority}`,
-          `X-BoxLite-Authorization: Bearer ${apiKey.trim()}`,
+          `X-BoxLite-Authorization: Bearer ${safeKey}`,
           '',
           ''
         ].join('\r\n');
