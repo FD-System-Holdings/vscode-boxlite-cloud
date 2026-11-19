@@ -1978,7 +1978,14 @@ class BoxLiteBridge:
 
             # Formulate structured diagnostic guidance according to §5
             diagnosis = None
-            if "502" in message or "unreachable" in message.lower():
+            lower_msg = message.lower()
+            if "box networking is disabled" in lower_msg or "no guest nic" in lower_msg:
+                diagnosis = (
+                    "Box networking is permanently disabled: this box was created with Outbound Network disabled "
+                    "(no guest NIC provisioned at creation, e.g. Quick Create or Air-Gapped mode). Network policies "
+                    "and tunnels cannot be modified after creation — create a new box with Outbound Network enabled."
+                )
+            elif "502" in message or "unreachable" in lower_msg:
                 diagnosis = "502 Bad Gateway / Box unreachable: Check app listener on 0.0.0.0, /tmp/server.log, network inbound mode, and tunnel declaration (agent.md §5)."
             elif "401" in message or "unauthorized" in message.lower() or ("invalid credentials" in message.lower() and "403" not in message):
                 diagnosis = "401 Unauthorized: Invalid credentials or missing token. Check credentials and BOXLITE_API_KEY via 'BoxLite: Sign In / Set API Key' (agent.md §5)."

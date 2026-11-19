@@ -38,6 +38,13 @@ describe('Error Diagnostics (§5 Table Mapping)', () => {
     assert.strictEqual(diag.checklist.some((item) => item.includes('auto_remove')), true);
   });
 
+  it('should diagnose box networking disabled (400 unsupported) without misattributing to auto_remove', () => {
+    const diag = diagnoseError('BoxLite Cloud API error (400): unsupported: box networking is disabled');
+    assert.strictEqual(diag.summary, 'Box Networking Permanently Disabled (No Guest NIC)');
+    assert.strictEqual(diag.checklist.some((item) => item.includes('auto_remove')), false);
+    assert.strictEqual(diag.checklist.some((item) => item.includes('Create Box with Options')), true);
+  });
+
   it('should diagnose proxy TLS CA certificate verification failures', () => {
     const diag = diagnoseError('SSL: CERTIFICATE_VERIFY_FAILED against ca-certificates.crt');
     assert.strictEqual(diag.summary.includes('TLS Certificate Verification Failed'), true);

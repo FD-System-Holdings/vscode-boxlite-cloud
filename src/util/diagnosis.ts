@@ -86,6 +86,17 @@ export function diagnoseError(errorMessage: string, code?: string): DiagnosticMe
     };
   }
 
+  if (lower.includes('box networking is disabled') || lower.includes('no guest nic')) {
+    return {
+      summary: 'Box Networking Permanently Disabled (No Guest NIC)',
+      checklist: [
+        'This box was created with Outbound Network disabled (no guest NIC provisioned at creation, e.g. Quick Create or Air-Gapped mode)',
+        'BoxLite Cloud does not allow enabling outbound networking, inbound access, or tunnels after creation on a no-NIC box',
+        'Create a new box with Outbound Network enabled via "BoxLite: Create Box with Options..."'
+      ]
+    };
+  }
+
   if (lower.includes('400') || lower.includes('bad request') || lower.includes('should not exist')) {
     return {
       summary: '400 Bad Request / Schema Validation Error',

@@ -55,6 +55,21 @@ import {
   generateBoxName
 } from './boxConfiguration';
 
+function isNetworkDisabledError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
+  return msg.includes('box networking is disabled') || msg.includes('no guest nic');
+}
+
+async function handleNetworkDisabledError(actionLabel: string, boxId: string): Promise<void> {
+  const choice = await vscode.window.showErrorMessage(
+    `${actionLabel}: Box ${boxId.substring(0, 8)} was created with Outbound Network disabled (no guest NIC provisioned at creation, e.g. Quick Create / Air-Gapped mode). Network policies and tunnels cannot be modified after creation — create a new box with Outbound Network enabled.`,
+    'Create Box with Options...'
+  );
+  if (choice === 'Create Box with Options...') {
+    await vscode.commands.executeCommand('boxlite.createBoxWithOptions');
+  }
+}
+
 export function registerCommands(
   context: vscode.ExtensionContext,
   bridge: BoxLiteBridgeClient,
@@ -287,7 +302,7 @@ export function registerCommands(
         {
           label: '$(zap) Quick Create (Small Python Box)',
           description: 'python image · 1 vCPU · 1 GiB RAM · 10 GiB Disk · Network disabled · Stop on idle: 5m',
-          detail: 'Fast one-click creation using small box sizing with inbound and outbound network disabled (agent.md §3)',
+          detail: 'Fast one-click creation using small box sizing with inbound and outbound network permanently disabled (no guest NIC, agent.md §3)',
           action: 'quick'
         },
         {
@@ -574,7 +589,11 @@ export function registerCommands(
         }
         treeProvider.refresh();
       } catch (e: any) {
-        vscode.window.showErrorMessage(`Failed to update access: ${e.message}`);
+        if (isNetworkDisabledError(e)) {
+          await handleNetworkDisabledError('Cannot update inbound access', boxId);
+        } else {
+          vscode.window.showErrorMessage(`Failed to update access: ${e.message}`);
+        }
       }
     })
   );
@@ -642,7 +661,11 @@ export function registerCommands(
         vscode.window.showInformationMessage(`Outbound network policy updated for Box ${boxId.substring(0, 8)}.`);
         treeProvider.refresh();
       } catch (e: any) {
-        vscode.window.showErrorMessage(`Failed to update outbound network: ${e.message}`);
+        if (isNetworkDisabledError(e)) {
+          await handleNetworkDisabledError('Cannot update outbound network', boxId);
+        } else {
+          vscode.window.showErrorMessage(`Failed to update outbound network: ${e.message}`);
+        }
       }
     })
   );

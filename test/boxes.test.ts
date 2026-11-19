@@ -212,4 +212,80 @@ describe('Box Tree Items and Lifecycle Management', () => {
     assert.strictEqual(emptyItem.description, 'Click to create a microvm box');
     assert.strictEqual(emptyItem.command?.command, 'boxlite.createBox');
   });
+
+  it('should surface actionable no-NIC error and Create Box with Options action when configureOutbound or setAccess hits box networking is disabled', async () => {
+    const vscode = require('vscode');
+    const { registerCommands } = require('../src/commands');
+
+    const origShowQuickPick = vscode.window.showQuickPick;
+    const origShowErrorMessage = vscode.window.showErrorMessage;
+    const origExecuteCommand = vscode.commands.executeCommand;
+
+    const shownErrors: Array<{ msg: string; buttons: string[] }> = [];
+    const executedCmds: string[] = [];
+
+    try {
+      const mockBridge: any = {
+        updateOutbound: async () => {
+          throw new Error(
+            'BoxLite error [RuntimeError]: BoxLite Cloud API error (400): unsupported: box networking is disabled\nDiagnosis: Box networking is permanently disabled'
+          );
+        },
+        updateInbound: async () => {
+          throw new Error(
+            'BoxLite error [RuntimeError]: BoxLite Cloud API error (400): unsupported: box networking is disabled\nDiagnosis: Box networking is permanently disabled'
+          );
+        }
+      };
+
+      registerCommands(
+        { subscriptions: [] } as any,
+        mockBridge,
+        {} as any,
+        {} as any,
+        { refresh: () => {} } as any,
+        {} as any,
+        {} as any
+      );
+
+      vscode.window.showErrorMessage = async (msg: string, ...buttons: string[]) => {
+        shownErrors.push({ msg, buttons });
+        return buttons.includes('Create Box with Options...') ? 'Create Box with Options...' : undefined;
+      };
+      vscode.commands.executeCommand = async (id: string, ...args: any[]) => {
+        executedCmds.push(id);
+        if (id !== 'boxlite.createBoxWithOptions') {
+          return origExecuteCommand(id, ...args);
+        }
+      };
+
+      const boxItem = new BoxTreeItem({
+        id: 'box-no-nic-1234',
+        name: 'quick-box',
+        status: 'running'
+      });
+
+      vscode.window.showQuickPick = async (items: any[]) =>
+        items.find((i: any) => i.label.startsWith('Enabled (Unrestricted)'));
+      await origExecuteCommand('boxlite.configureOutbound', boxItem);
+
+      vscode.window.showQuickPick = async (items: any[]) =>
+        items.find((i: any) => i.label.startsWith('Public'));
+      await origExecuteCommand('boxlite.setAccess', boxItem);
+
+      assert.strictEqual(shownErrors.length, 2);
+      assert.ok(shownErrors[0].msg.includes('Cannot update outbound network'));
+      assert.ok(shownErrors[0].msg.includes('no guest NIC provisioned at creation'));
+      assert.ok(!shownErrors[0].msg.includes('auto_remove'));
+      assert.ok(shownErrors[0].buttons.includes('Create Box with Options...'));
+
+      assert.ok(shownErrors[1].msg.includes('Cannot update inbound access'));
+      assert.ok(shownErrors[1].buttons.includes('Create Box with Options...'));
+      assert.deepStrictEqual(executedCmds, ['boxlite.createBoxWithOptions', 'boxlite.createBoxWithOptions']);
+    } finally {
+      vscode.window.showQuickPick = origShowQuickPick;
+      vscode.window.showErrorMessage = origShowErrorMessage;
+      vscode.commands.executeCommand = origExecuteCommand;
+    }
+  });
 });
