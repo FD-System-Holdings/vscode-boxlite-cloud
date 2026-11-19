@@ -281,49 +281,50 @@ class RestRuntimeFallback:
 
     async def list_images(self) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(None, self._request, "GET", "/images")
+        if isinstance(res, dict):
+            raw_images = res.get("images")
+            if not isinstance(raw_images, list):
+                raw_images = (
+                    res.get("items")
+                    if isinstance(res.get("items"), list)
+                    else (res.get("data") if isinstance(res.get("data"), list) else [])
+                )
+            images = raw_images
+        elif isinstance(res, list):
+            images = res
+        else:
+            images = []
+        usage = None
         try:
-            res = await loop.run_in_executor(None, self._request, "GET", "/images")
-            if isinstance(res, dict):
-                raw_images = res.get("images")
-                if not isinstance(raw_images, list):
-                    raw_images = (
-                        res.get("items")
-                        if isinstance(res.get("items"), list)
-                        else (res.get("data") if isinstance(res.get("data"), list) else [])
-                    )
-                images = raw_images
-            elif isinstance(res, list):
-                images = res
-            else:
-                images = []
-            usage = None
-            try:
-                usage_res = await loop.run_in_executor(None, self._request, "GET", "/images/usage")
-                if isinstance(usage_res, dict):
-                    usage = usage_res
-            except Exception:
-                pass
-            return {"images": images, "usage": usage}
-        except Exception as e:
-            log_debug(f"RestRuntimeFallback.list_images failed: {e}")
-            return {"images": [], "usage": None}
+            usage_res = await loop.run_in_executor(None, self._request, "GET", "/images/usage")
+            if isinstance(usage_res, dict):
+                usage = usage_res
+        except Exception:
+            pass
+        return {"images": images, "usage": usage}
 
     async def get_image(self, name: str) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._request, "GET", f"/images/{name}")
+        encoded_name = urllib.parse.quote(name, safe="")
+        return await loop.run_in_executor(None, self._request, "GET", f"/images/{encoded_name}")
 
     async def remove_image(self, name: str) -> None:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._request, "DELETE", f"/images/{name}")
+        encoded_name = urllib.parse.quote(name, safe="")
+        await loop.run_in_executor(None, self._request, "DELETE", f"/images/{encoded_name}")
 
     async def create_image_alias(self, name: str, alias: str, digest: str) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
+        encoded_name = urllib.parse.quote(name, safe="")
         body = {"alias": alias, "digest": digest}
-        return await loop.run_in_executor(None, self._request, "POST", f"/images/{name}/aliases", body)
+        return await loop.run_in_executor(None, self._request, "POST", f"/images/{encoded_name}/aliases", body)
 
     async def delete_image_alias(self, name: str, alias: str) -> None:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._request, "DELETE", f"/images/{name}/aliases/{alias}")
+        encoded_name = urllib.parse.quote(name, safe="")
+        encoded_alias = urllib.parse.quote(alias, safe="")
+        await loop.run_in_executor(None, self._request, "DELETE", f"/images/{encoded_name}/aliases/{encoded_alias}")
 
     async def create_registry_login(self, registry_host: str, username: str, password: str, repository_prefix: Optional[str] = None) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
@@ -504,6 +505,66 @@ class BoxLiteBridge:
             self.rt = RestRuntimeFallback(rest_url, api_key)
             return self.rt
 
+    def _rest_fallback(self, rt: Any) -> RestRuntimeFallback:
+        if isinstance(rt, RestRuntimeFallback):
+            return rt
+        return RestRuntimeFallback(
+            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
+            os.environ.get("BOXLITE_API_KEY", "")
+        )
+
+    def _build_rest_create_kwargs(
+        self,
+        *,
+        image: Optional[str],
+        name: Optional[str],
+        auto_stop: Any,
+        auto_delete: Any,
+        auto_resume: Any,
+        cpus: Any,
+        memory_mib: Any,
+        disk_size_gb: Any,
+        env: Any,
+        cmd: Any,
+        entrypoint: Any,
+        network_spec: Any,
+        volumes: Any,
+        secrets_payload: Any,
+    ) -> Dict[str, Any]:
+        # BoxLite Cloud REST API conforms to OpenAPI CreateBoxRequest.
+        # 'auto_remove' is deprecated/client-side and MUST NOT be sent across the wire.
+        kwargs: Dict[str, Any] = {
+            "image": image or "python",
+        }
+        if name:
+            kwargs["name"] = name
+        if auto_stop is not None:
+            # Boxlite Cloud requires auto_stop to be 0 (disabled) or >= 60 seconds
+            kwargs["auto_stop"] = 60 if 0 < auto_stop < 60 else auto_stop
+        if auto_delete is not None and auto_delete > 0:
+            kwargs["auto_delete"] = auto_delete
+        if auto_resume is not None:
+            kwargs["auto_resume"] = auto_resume
+        if cpus is not None:
+            kwargs["cpus"] = cpus
+        if memory_mib is not None:
+            kwargs["memory_mib"] = memory_mib
+        if disk_size_gb is not None:
+            kwargs["disk_size_gb"] = disk_size_gb
+        if env:
+            kwargs["env"] = env
+        if cmd:
+            kwargs["cmd"] = cmd
+        if entrypoint:
+            kwargs["entrypoint"] = entrypoint
+        if network_spec:
+            kwargs["network"] = network_spec
+        if volumes:
+            kwargs["volumes"] = volumes
+        if secrets_payload:
+            kwargs["secrets"] = secrets_payload
+        return kwargs
+
     def get_or_attach_box(self, box_id: str, name: Optional[str] = None):
         if box_id in self.boxes:
             return self.boxes[box_id]
@@ -637,10 +698,7 @@ class BoxLiteBridge:
                 }
             except TypeError as e:
                 log_debug(f"BoxOptions(checkpoint=...) not supported in installed wheel ({e}); falling back to REST")
-                fallback = RestRuntimeFallback(
-                    os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-                    os.environ.get("BOXLITE_API_KEY", "")
-                )
+                fallback = self._rest_fallback(rt)
                 rest_kwargs = {"checkpoint_id": checkpoint}
                 if name:
                     rest_kwargs["name"] = name
@@ -668,40 +726,22 @@ class BoxLiteBridge:
         redacted_secrets = self._redact_secrets(secrets_payload)
 
         if isinstance(rt, RestRuntimeFallback):
-            # BoxLite Cloud REST API conforms to OpenAPI CreateBoxRequest.
-            # 'auto_remove' is deprecated/client-side and MUST NOT be sent across the wire.
-            kwargs: Dict[str, Any] = {
-                "image": image or "python",
-            }
-            if name:
-                kwargs["name"] = name
-            if auto_stop is not None:
-                # Boxlite Cloud requires auto_stop to be 0 (disabled) or >= 60 seconds
-                if 0 < auto_stop < 60:
-                    auto_stop = 60
-                kwargs["auto_stop"] = auto_stop
-            if auto_delete is not None and auto_delete > 0:
-                kwargs["auto_delete"] = auto_delete
-            if auto_resume is not None:
-                kwargs["auto_resume"] = auto_resume
-            if cpus is not None:
-                kwargs["cpus"] = cpus
-            if memory_mib is not None:
-                kwargs["memory_mib"] = memory_mib
-            if disk_size_gb is not None:
-                kwargs["disk_size_gb"] = disk_size_gb
-            if env:
-                kwargs["env"] = env
-            if cmd:
-                kwargs["cmd"] = cmd
-            if entrypoint:
-                kwargs["entrypoint"] = entrypoint
-            if network_spec:
-                kwargs["network"] = network_spec
-            if volumes:
-                kwargs["volumes"] = volumes
-            if secrets_payload:
-                kwargs["secrets"] = secrets_payload
+            kwargs = self._build_rest_create_kwargs(
+                image=image,
+                name=name,
+                auto_stop=auto_stop,
+                auto_delete=auto_delete,
+                auto_resume=auto_resume,
+                cpus=cpus,
+                memory_mib=memory_mib,
+                disk_size_gb=disk_size_gb,
+                env=env,
+                cmd=cmd,
+                entrypoint=entrypoint,
+                network_spec=network_spec,
+                volumes=volumes,
+                secrets_payload=secrets_payload,
+            )
 
             res = await rt.create(**kwargs)
             box_id = res.get("box_id") or res.get("id") or name
@@ -827,38 +867,23 @@ class BoxLiteBridge:
                     self.boxes[box_id] = box
                 except Exception as inner_e:
                     log_debug(f"BoxOptions with secrets failed ({inner_e}); falling back to REST")
-                    fallback = RestRuntimeFallback(
-                        os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-                        os.environ.get("BOXLITE_API_KEY", "")
+                    fallback = self._rest_fallback(rt)
+                    rest_kwargs = self._build_rest_create_kwargs(
+                        image=image,
+                        name=name,
+                        auto_stop=auto_stop,
+                        auto_delete=auto_delete,
+                        auto_resume=auto_resume,
+                        cpus=cpus,
+                        memory_mib=memory_mib,
+                        disk_size_gb=disk_size_gb,
+                        env=env,
+                        cmd=cmd,
+                        entrypoint=entrypoint,
+                        network_spec=network_spec,
+                        volumes=volumes,
+                        secrets_payload=secrets_payload,
                     )
-                    rest_kwargs: Dict[str, Any] = {
-                        "image": image or "python",
-                        "secrets": secrets_payload
-                    }
-                    if name:
-                        rest_kwargs["name"] = name
-                    if auto_stop is not None:
-                        rest_kwargs["auto_stop"] = 60 if 0 < auto_stop < 60 else auto_stop
-                    if auto_delete is not None and auto_delete > 0:
-                        rest_kwargs["auto_delete"] = auto_delete
-                    if auto_resume is not None:
-                        rest_kwargs["auto_resume"] = auto_resume
-                    if cpus is not None:
-                        rest_kwargs["cpus"] = cpus
-                    if memory_mib is not None:
-                        rest_kwargs["memory_mib"] = memory_mib
-                    if disk_size_gb is not None:
-                        rest_kwargs["disk_size_gb"] = disk_size_gb
-                    if env:
-                        rest_kwargs["env"] = env
-                    if cmd:
-                        rest_kwargs["cmd"] = cmd
-                    if entrypoint:
-                        rest_kwargs["entrypoint"] = entrypoint
-                    if network_spec:
-                        rest_kwargs["network"] = network_spec
-                    if volumes:
-                        rest_kwargs["volumes"] = volumes
                     res = await fallback.create(**rest_kwargs)
                     box_id = res.get("box_id") or res.get("id") or name
                     await fallback.start(box_id)
@@ -1074,12 +1099,18 @@ class BoxLiteBridge:
         log_file = args.get("logFile", "/tmp/server.log")
         lines = int(args.get("lines", 100))
         rt = self.ensure_runtime()
+        box = self.get_or_attach_box(box_id)
 
         # Prevent waking up stopped boxes with tail execution
+        stopped_states = ("stopped", "stopping", "terminated", "exited", "configured", "paused", "inactive", "shutdown")
         try:
-            info = await rt.inspect(box_id) if hasattr(rt, "inspect") else None
+            info = None
+            if hasattr(box, "inspect") and callable(box.inspect):
+                info = await box.inspect()
+            elif hasattr(rt, "inspect") and callable(rt.inspect):
+                info = await rt.inspect(box_id)
             status = extract_box_status(info)
-            if status not in ("running", "ready", "active"):
+            if status in stopped_states:
                 return {
                     "boxId": box_id,
                     "content": "",
@@ -1095,8 +1126,6 @@ class BoxLiteBridge:
                 "status": "stopped",
                 "stopped": True
             }
-
-        box = self.get_or_attach_box(box_id)
 
         res = await box.exec("tail", f"-n{lines}", log_file)
         if hasattr(res, "wait") and callable(res.wait):
@@ -1124,11 +1153,7 @@ class BoxLiteBridge:
                 volumes = await handle.list()
             except Exception as e:
                 log_debug(f"rt.volumes().list() failed ({e}), falling back to REST")
-                fallback = RestRuntimeFallback(
-                    os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-                    os.environ.get("BOXLITE_API_KEY", "")
-                )
-                volumes = await fallback.list_volumes()
+                volumes = await self._rest_fallback(rt).list_volumes()
         elif hasattr(rt, "list_volumes"):
             volumes = await rt.list_volumes()
 
@@ -1197,11 +1222,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.volumes().create() failed ({e}), falling back to REST")
 
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        res = await fallback.create_volume(name=name)
+        res = await self._rest_fallback(rt).create_volume(name=name)
         v_id = res.get("id") or res.get("volume_id") or ""
         v_name = res.get("name") or v_id
         v_state = res.get("state") or "ready"
@@ -1236,11 +1257,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.volumes().get() failed ({e}), falling back to REST")
 
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        res = await fallback.get_volume(volume_id)
+        res = await self._rest_fallback(rt).get_volume(volume_id)
         return {"volume": res}
 
     async def handle_remove_volume(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1255,11 +1272,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.volumes().remove() failed ({e}), falling back to REST")
 
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        await fallback.remove_volume(volume_id, force=force)
+        await self._rest_fallback(rt).remove_volume(volume_id, force=force)
         return {"volumeId": volume_id, "removed": True}
 
     def _serialize_timestamp(self, val: Any) -> Optional[str]:
@@ -1372,11 +1385,7 @@ class BoxLiteBridge:
                     log_debug(f"rt.images.usage() failed: {e}")
 
         if not images and not usage:
-            fallback = RestRuntimeFallback(
-                os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-                os.environ.get("BOXLITE_API_KEY", "")
-            )
-            fallback_res = await fallback.list_images()
+            fallback_res = await self._rest_fallback(rt).list_images()
             images = fallback_res.get("images", [])
             usage = fallback_res.get("usage")
 
@@ -1446,14 +1455,7 @@ class BoxLiteBridge:
                 log_debug(f"rt.images.get() failed ({e}), falling back to REST")
 
         if data is None:
-            fallback = RestRuntimeFallback(
-                os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-                os.environ.get("BOXLITE_API_KEY", "")
-            )
-            try:
-                data = await fallback.get_image(name)
-            except Exception as e:
-                data = {"name": name, "versions": [], "aliases": [], "history": []}
+            data = await self._rest_fallback(rt).get_image(name)
 
         return {"image": data}
 
@@ -1469,11 +1471,7 @@ class BoxLiteBridge:
                 except Exception as e:
                     log_debug(f"rt.images.remove() failed ({e}), falling back to REST")
 
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        await fallback.remove_image(name)
+        await self._rest_fallback(rt).remove_image(name)
         return {"name": name, "removed": True}
 
     async def handle_create_image_alias(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1490,11 +1488,7 @@ class BoxLiteBridge:
                 except Exception as e:
                     log_debug(f"rt.images.create_alias() failed ({e}), falling back to REST")
 
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        res = await fallback.create_image_alias(name, alias, digest)
+        await self._rest_fallback(rt).create_image_alias(name, alias, digest)
         return {"name": name, "alias": alias, "digest": digest}
 
     async def handle_delete_image_alias(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1510,11 +1504,7 @@ class BoxLiteBridge:
                 except Exception as e:
                     log_debug(f"rt.images.delete_alias() failed ({e}), falling back to REST")
 
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        await fallback.delete_image_alias(name, alias)
+        await self._rest_fallback(rt).delete_image_alias(name, alias)
         return {"name": name, "alias": alias, "deleted": True}
 
     async def handle_create_registry_login(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1541,11 +1531,7 @@ class BoxLiteBridge:
                 except Exception as e:
                     log_debug(f"rt.images.registries.create() failed ({e}), falling back to REST")
 
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        await fallback.create_registry_login(registry_host, username, password, prefix)
+        await self._rest_fallback(rt).create_registry_login(registry_host, username, password, prefix)
         return {"success": True, "registryHost": registry_host}
 
     def _format_checkpoint(self, c: Any) -> Dict[str, Any]:
@@ -1603,14 +1589,7 @@ class BoxLiteBridge:
                 log_debug(f"rt.checkpoints.list() failed ({e}), falling back to REST")
 
         if checkpoints is None:
-            if isinstance(rt, RestRuntimeFallback):
-                checkpoints = await rt.list_checkpoints()
-            else:
-                fallback = RestRuntimeFallback(
-                    os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-                    os.environ.get("BOXLITE_API_KEY", "")
-                )
-                checkpoints = await fallback.list_checkpoints()
+            checkpoints = await self._rest_fallback(rt).list_checkpoints()
 
         return {"checkpoints": [self._format_checkpoint(c) for c in (checkpoints or [])]}
 
@@ -1630,15 +1609,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.checkpoints.create() failed ({e}), falling back to REST")
 
-        if isinstance(rt, RestRuntimeFallback):
-            res = await rt.create_checkpoint(source_box_id, name=name)
-            return self._format_checkpoint(res)
-
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        res = await fallback.create_checkpoint(source_box_id, name=name)
+        res = await self._rest_fallback(rt).create_checkpoint(source_box_id, name=name)
         return self._format_checkpoint(res)
 
     async def handle_inspect_checkpoint(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1659,15 +1630,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.checkpoints.get() failed ({e}), falling back to REST")
 
-        if isinstance(rt, RestRuntimeFallback):
-            res = await rt.get_checkpoint(key)
-            return {"checkpoint": res}
-
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        res = await fallback.get_checkpoint(key)
+        res = await self._rest_fallback(rt).get_checkpoint(key)
         return {"checkpoint": res}
 
     async def handle_remove_checkpoint(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1683,15 +1646,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.checkpoints.remove() failed ({e}), falling back to REST")
 
-        if isinstance(rt, RestRuntimeFallback):
-            await rt.remove_checkpoint(key, force=force)
-            return {"checkpointKey": key, "removed": True}
-
-        fallback = RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-        await fallback.remove_checkpoint(key, force=force)
+        await self._rest_fallback(rt).remove_checkpoint(key, force=force)
         return {"checkpointKey": key, "removed": True}
 
     async def handle_verify_secret_injection(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1700,7 +1655,6 @@ class BoxLiteBridge:
         host = args.get("host") or "httpbingo.org"
         token = "demo-not-a-real-key-" + py_secrets.token_hex(16)
         box_id = None
-        cleaned_up = False
 
         try:
             created = await self.handle_create_box({
@@ -1763,7 +1717,6 @@ class BoxLiteBridge:
                         del self.boxes[box_id]
                     if box_id in self.box_secrets:
                         del self.box_secrets[box_id]
-                    cleaned_up = True
                 except Exception as cleanup_err:
                     log_debug(f"Failed to remove verification box {box_id}: {cleanup_err}")
 
@@ -1841,14 +1794,6 @@ class BoxLiteBridge:
             out["errorReason"] = str(error_reason)
         return out
 
-    def _domain_rest_fallback(self, rt: Any) -> RestRuntimeFallback:
-        if isinstance(rt, RestRuntimeFallback):
-            return rt
-        return RestRuntimeFallback(
-            os.environ.get("BOXLITE_REST_URL", "https://api.boxlite.ai"),
-            os.environ.get("BOXLITE_API_KEY", "")
-        )
-
     async def handle_list_domains(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         domains = None
@@ -1860,7 +1805,7 @@ class BoxLiteBridge:
                 log_debug(f"rt.domains.list() failed ({e}), falling back to REST")
 
         if domains is None:
-            domains = await self._domain_rest_fallback(rt).list_domains()
+            domains = await self._rest_fallback(rt).list_domains()
 
         return {"domains": [self._format_domain(d) for d in (domains or [])]}
 
@@ -1878,7 +1823,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.domains.create() failed ({e}), falling back to REST")
 
-        res = await self._domain_rest_fallback(rt).create_domain(domain, box_id=box_id, port=port)
+        res = await self._rest_fallback(rt).create_domain(domain, box_id=box_id, port=port)
         return self._format_domain(res)
 
     async def handle_inspect_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1899,7 +1844,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.domains.get() failed ({e}), falling back to REST")
 
-        res = await self._domain_rest_fallback(rt).get_domain(key)
+        res = await self._rest_fallback(rt).get_domain(key)
         return {"domain": res}
 
     async def handle_verify_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1914,7 +1859,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.domains.verify() failed ({e}), falling back to REST")
 
-        res = await self._domain_rest_fallback(rt).verify_domain(key)
+        res = await self._rest_fallback(rt).verify_domain(key)
         return self._format_domain(res)
 
     async def handle_update_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1931,7 +1876,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.domains.update() failed ({e}), falling back to REST")
 
-        res = await self._domain_rest_fallback(rt).update_domain(key, box_id=box_id, port=port)
+        res = await self._rest_fallback(rt).update_domain(key, box_id=box_id, port=port)
         return self._format_domain(res)
 
     async def handle_remove_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1946,7 +1891,7 @@ class BoxLiteBridge:
             except Exception as e:
                 log_debug(f"rt.domains.remove() failed ({e}), falling back to REST")
 
-        await self._domain_rest_fallback(rt).remove_domain(key)
+        await self._rest_fallback(rt).remove_domain(key)
         return {"domainKey": key, "removed": True}
 
     async def dispatch(self, req: Dict[str, Any]):

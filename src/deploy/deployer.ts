@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as https from 'https';
 import * as http from 'http';
 import { BoxLiteBridgeClient } from '../bridge/client';
@@ -9,8 +10,95 @@ import { CredentialsManager } from '../auth/credentials';
 import { SecretsManager } from '../auth/secretsStore';
 import { ProjectManager, buildSupervisorEntrypoint } from './project';
 import { LogStreamManager } from '../logs/logStream';
-import { diagnoseError } from '../util/diagnosis';
+import { formatErrorWithDiagnosis } from '../util/diagnosis';
 import { formatSecretPlaceholder, validateEnvAgainstSecrets } from '../util/validation';
+
+export function matchesIgnorePattern(entryName: string, relativePath: string, patterns: string[]): boolean {
+  const normalizedRel = relativePath.replace(/\\/g, '/');
+  for (const rawPattern of patterns) {
+    const pattern = rawPattern.trim().replace(/\/+$/, '');
+    if (!pattern) {
+      continue;
+    }
+    if (pattern.startsWith('*')) {
+      const suffix = pattern.slice(1);
+      if (entryName.endsWith(suffix) || normalizedRel.endsWith(suffix)) {
+        return true;
+      }
+    } else if (
+      entryName === pattern ||
+      normalizedRel === pattern ||
+      normalizedRel.startsWith(`${pattern}/`)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function stageAppDirectory(appDir: string, ignorePatterns: string[]): string {
+  const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-deploy-'));
+
+  const copyFiltered = (srcDir: string, dstDir: string, relPrefix: string) => {
+    const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const relPath = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+      if (matchesIgnorePattern(entry.name, relPath, ignorePatterns)) {
+        continue;
+      }
+      const srcPath = path.join(srcDir, entry.name);
+      const dstPath = path.join(dstDir, entry.name);
+      if (entry.isDirectory()) {
+        fs.mkdirSync(dstPath, { recursive: true });
+        copyFiltered(srcPath, dstPath, relPath);
+      } else if (entry.isSymbolicLink()) {
+        const target = fs.readlinkSync(srcPath);
+        fs.symlinkSync(target, dstPath);
+      } else {
+        fs.copyFileSync(srcPath, dstPath);
+      }
+    }
+  };
+
+  copyFiltered(appDir, stagingDir, '');
+  return stagingDir;
+}
+
+export function buildRestartCommand(startCmd: string = 'python3 -u server.py'): string {
+  const trimmed = (startCmd || 'python3 -u server.py').trim();
+  const escaped = trimmed.replace(/'/g, "'\\''");
+  const firstToken = trimmed.split(/\s+/)[0] || '';
+  const escapedToken = firstToken.replace(/'/g, "'\\''");
+  const isShell = firstToken === 'sh' || firstToken === 'bash' || firstToken === '/bin/sh' || firstToken === '/bin/bash';
+  const tokenBranch = firstToken && !isShell ? `|*'${escapedToken} '*` : '';
+  return [
+    `for p in /proc/[0-9]*; do`,
+    `  pid=\${p#/proc/};`,
+    `  [ "$pid" = "1" ] || [ "$pid" = "$$" ] && continue;`,
+    `  cmd=$(tr '\\0' ' ' < "$p/cmdline" 2>/dev/null || true);`,
+    `  case "$cmd" in *"while true;"*|*"/proc/[0-9]*"*) continue ;; *'${escaped}'*${tokenBranch}) kill "$pid" 2>/dev/null || true ;; esac;`,
+    `done`
+  ].join(' ');
+}
+
+export function buildHealthProbeCommand(port: number, healthPath: string): string {
+  const normalizedPath = healthPath.startsWith('/') ? healthPath : `/${healthPath}`;
+  const url = `http://127.0.0.1:${port}${normalizedPath}`;
+  const escapedUrl = url.replace(/'/g, "'\\''");
+  return [
+    `if command -v curl >/dev/null 2>&1; then`,
+    `  curl -fsS --max-time 2 '${escapedUrl}' >/dev/null;`,
+    `elif command -v wget >/dev/null 2>&1; then`,
+    `  wget -q -T 2 -O /dev/null '${escapedUrl}';`,
+    `elif command -v python3 >/dev/null 2>&1; then`,
+    `  python3 -c "import urllib.request; r = urllib.request.urlopen('${escapedUrl}', timeout=2); assert 200 <= r.status < 300";`,
+    `elif command -v node >/dev/null 2>&1; then`,
+    `  node -e "fetch('${escapedUrl}', { signal: AbortSignal.timeout(2000) }).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))";`,
+    `else`,
+    `  exit 127;`,
+    `fi`
+  ].join(' ');
+}
 
 export class BoxLiteDeployer {
   constructor(
@@ -19,7 +107,9 @@ export class BoxLiteDeployer {
     private logManager: LogStreamManager,
     private outputChannel: vscode.OutputChannel,
     private onDeploySuccess?: () => void,
-    private secretsManager?: SecretsManager
+    private secretsManager?: SecretsManager,
+    private healthPollIntervalMs: number = 2000,
+    private externalCheckFn: (url: string, token?: string) => Promise<number> = checkHttpHealth
   ) {}
 
   public async deployWorkspace(targetBoxId?: string): Promise<void> {
@@ -166,8 +256,13 @@ export class BoxLiteDeployer {
             const created = await this.bridge.createBox({
               name: boxName,
               image: config.image || 'python',
+              cpus: config.cpus,
+              memoryMib: config.memoryMib,
+              diskSizeGb: config.diskSizeGb,
               autoRemove: false,
               autoStop: config.autoStop ?? 0,
+              autoDelete: config.autoDelete,
+              autoResume: config.autoResume,
               entrypoint: supervisor,
               env: Object.keys(envMap).length > 0 ? envMap : undefined,
               network: {
@@ -193,52 +288,79 @@ export class BoxLiteDeployer {
             throw new Error(`Failed to create /app in guest: ${mkdirRes.stderr}`);
           }
 
-          // Step 4: Copy application files
+          // Step 4: Copy filtered application files (excluding .env, .git, node_modules, .venv, etc.)
           progress.report({ message: 'Uploading application code...' });
-          this.outputChannel.appendLine(`[deploy] Copying ${appDir} to /app...`);
-          // Note: copy contents via source + "/."
-          const sourcePath = appDir.endsWith('/') || appDir.endsWith('\\') ? appDir + '.' : appDir + '/.';
-          await this.bridge.copyIn(boxId, sourcePath, '/app');
-
-          // Clean any ignored paths (.venv, node_modules, .env, __pycache__) from guest rootfs
+          this.outputChannel.appendLine(`[deploy] Staging and copying ${appDir} to /app...`);
           const ignores = ProjectManager.getIgnorePatterns(workspaceRoot);
-          for (const ign of ignores) {
-            if (ign.startsWith('*')) {
-              continue;
+          const stagingDir = stageAppDirectory(appDir, ignores);
+          try {
+            const sourcePath = stagingDir.endsWith('/') || stagingDir.endsWith('\\') ? stagingDir + '.' : stagingDir + '/.';
+            await this.bridge.copyIn(boxId, sourcePath, '/app');
+          } finally {
+            try {
+              fs.rmSync(stagingDir, { recursive: true, force: true });
+            } catch {
+              // Ignore cleanup errors
             }
-            await this.bridge.exec(boxId, 'rm', ['-rf', `/app/${ign}`]);
           }
 
           // Step 5: Restart running process so supervisor re-launches with newly deployed files
           progress.report({ message: 'Restarting application in guest...' });
-          await this.bridge.exec(boxId, 'sh', ['-c', 'pkill -f python3 || true']);
+          await this.bridge.exec(boxId, 'sh', ['-c', buildRestartCommand(config.start || 'python3 -u server.py')]);
           this.outputChannel.appendLine('[deploy] Code uploaded and application restart signal sent.');
 
           // Step 6: Wait for guest healthz readiness
           progress.report({ message: 'Verifying internal service health...' });
           const port = config.port || 8080;
           const healthPath = config.healthPath || '/healthz';
-          const probePy = `import urllib.request; resp = urllib.request.urlopen('http://127.0.0.1:${port}${healthPath}', timeout=2); assert 200 <= resp.status < 300`;
+          const probeCmd = buildHealthProbeCommand(port, healthPath);
 
           let healthy = false;
           for (let attempt = 1; attempt <= 30; attempt++) {
             this.outputChannel.appendLine(`[deploy] Health probe attempt ${attempt}/30...`);
-            const probeRes = await this.bridge.exec(boxId, 'python3', ['-c', probePy]);
+            const probeRes = await this.bridge.exec(boxId, 'sh', ['-c', probeCmd]);
             if (probeRes.exitCode === 0) {
               healthy = true;
               break;
             }
-            await new Promise((r) => setTimeout(r, 2000));
+            if (this.healthPollIntervalMs > 0) {
+              await new Promise((r) => setTimeout(r, this.healthPollIntervalMs));
+            }
           }
 
           if (!healthy) {
             const logs = await this.bridge.tailLog(boxId, '/tmp/server.log', 40);
-            this.outputChannel.appendLine(`[deploy] ERROR: App did not respond to /healthz. Recent logs:\n${logs.content}`);
+            this.outputChannel.appendLine(`[deploy] ERROR: App did not respond to ${healthPath}. Recent logs:\n${logs.content}`);
             throw new Error(`Service did not become healthy within 60s. Check /tmp/server.log output.`);
           }
           this.outputChannel.appendLine('[deploy] Guest service healthy!');
 
-          // Step 7: Configure network & declare tunnel
+          // Step 7: Configure network & declare tunnel (respecting boxlite.json network.inbound)
+          const inboundMode = config.network?.inbound || 'enabled';
+          if (inboundMode === 'disabled') {
+            progress.report({ message: 'Keeping inbound networking disabled...' });
+            await this.bridge.updateInbound(boxId, 'disabled');
+            this.outputChannel.appendLine('[deploy] Inbound networking is disabled per boxlite.json; skipping tunnel creation.');
+            this.outputChannel.appendLine(`\n=== Deployment Complete! ===`);
+
+            if (this.onDeploySuccess) {
+              this.onDeploySuccess();
+            }
+
+            const actionLogs = 'Stream Logs';
+            vscode.window
+              .showInformationMessage(
+                `Deployed ${config.name} successfully to BoxLite (inbound disabled)!`,
+                actionLogs
+              )
+              .then((selection) => {
+                if (selection === actionLogs) {
+                  this.logManager.openOrStreamLogs(boxId!, boxName);
+                }
+              });
+            return;
+          }
+
           progress.report({ message: 'Configuring network and tunnel...' });
           await this.bridge.updateInbound(boxId, 'enabled');
 
@@ -256,7 +378,7 @@ export class BoxLiteDeployer {
 
           for (let attempt = 1; attempt <= 10; attempt++) {
             try {
-              const status = await checkHttpHealth(checkUrl, tunnel.token);
+              const status = await this.externalCheckFn(checkUrl, tunnel.token);
               if (status === 200) {
                 externalOk = true;
                 break;
@@ -264,7 +386,9 @@ export class BoxLiteDeployer {
             } catch (err) {
               // Wait for cloud proxy propagation
             }
-            await new Promise((r) => setTimeout(r, 2000));
+            if (this.healthPollIntervalMs > 0) {
+              await new Promise((r) => setTimeout(r, this.healthPollIntervalMs));
+            }
           }
 
           if (!externalOk) {
@@ -307,9 +431,7 @@ export class BoxLiteDeployer {
             });
         } catch (error: any) {
           this.outputChannel.appendLine(`[deploy] ERROR: ${error.message}`);
-          const diag = diagnoseError(error.message);
-          const msg = error.message.includes('Diagnosis:') ? error.message : `${error.message}\nDiagnosis: ${diag.summary}`;
-          vscode.window.showErrorMessage(`Deployment failed: ${msg}`);
+          vscode.window.showErrorMessage(`Deployment failed: ${formatErrorWithDiagnosis(error)}`);
         }
       }
     );

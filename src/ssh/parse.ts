@@ -1,7 +1,5 @@
 import * as path from 'path';
 
-export const MIN_TESTED_CLI_VERSION = '0.10.5';
-
 export interface ParsedSshSetup {
   keyPath?: string;
   fingerprint?: string;

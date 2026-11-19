@@ -117,11 +117,16 @@ export class LogStreamManager implements vscode.Disposable {
       return;
     }
 
+    let inFlight = false;
     const interval = setInterval(async () => {
       if (this.isDisposed) {
         this.stopStreaming(boxId);
         return;
       }
+      if (inFlight) {
+        return;
+      }
+      inFlight = true;
       try {
         const res = await this.bridge.tailLog(boxId, '/tmp/server.log', 50);
         this.errorCounts.set(boxId, 0);
@@ -159,6 +164,8 @@ export class LogStreamManager implements vscode.Disposable {
           this.safeAppendLine(channel!, `[stream] Stopped polling: box is unreachable or inactive (${err.message})`);
           this.stopStreaming(boxId);
         }
+      } finally {
+        inFlight = false;
       }
     }, 2500);
 

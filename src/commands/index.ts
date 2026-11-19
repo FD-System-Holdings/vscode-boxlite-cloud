@@ -45,7 +45,7 @@ import {
   validateCustomDomain,
   ALLOWED_REGISTRY_HOSTS
 } from '../util/validation';
-import { diagnoseError } from '../util/diagnosis';
+import { formatErrorWithDiagnosis } from '../util/diagnosis';
 import {
   showBoxConfigurationWizard,
   BOX_TEMPLATES,
@@ -211,6 +211,7 @@ export function registerCommands(
     vscode.commands.registerCommand('boxlite.refresh', async () => {
       accountProvider?.refresh();
       treeProvider.refresh();
+      domainsProvider?.refresh();
       volumesProvider?.refresh();
       imagesProvider?.refresh();
       checkpointsProvider?.refresh();
@@ -265,8 +266,7 @@ export function registerCommands(
           imagesProvider?.refresh();
           secretsProvider?.refresh();
         } catch (e: any) {
-          const diag = diagnoseError(e.message);
-          const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+          const msg = formatErrorWithDiagnosis(e);
           vscode.window.showErrorMessage(`Failed to create Box: ${msg}`);
         }
       }
@@ -799,8 +799,7 @@ export function registerCommands(
         );
         volumesProvider?.refresh();
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to create volume: ${msg}`);
         return;
       }
@@ -966,10 +965,13 @@ export function registerCommands(
       if (!imageName) {
         return;
       }
-      const args = await showBoxConfigurationWizard({
-        image: imageName,
-        name: generateBoxName()
-      });
+      const args = await showBoxConfigurationWizard(
+        {
+          image: imageName,
+          name: generateBoxName()
+        },
+        secretsManager
+      );
       if (args) {
         await performCreateBox(args);
         imagesProvider?.refresh();
@@ -1190,10 +1192,13 @@ export function registerCommands(
       }
 
       // Action: create
-      const args = await showBoxConfigurationWizard({
-        image: imageRef,
-        name: generateBoxName()
-      });
+      const args = await showBoxConfigurationWizard(
+        {
+          image: imageRef,
+          name: generateBoxName()
+        },
+        secretsManager
+      );
 
       if (args) {
         await performCreateBox(args);
@@ -1307,8 +1312,7 @@ export function registerCommands(
             vscode.window.showInformationMessage(`Connected private registry "${registryHost}" successfully.`);
             imagesProvider?.refresh();
           } catch (e: any) {
-            const diag = diagnoseError(e.message);
-            const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+            const msg = formatErrorWithDiagnosis(e);
             vscode.window.showErrorMessage(`Failed to connect registry: ${msg}`);
           }
         }
@@ -1437,8 +1441,7 @@ export function registerCommands(
       );
       checkpointsProvider?.refresh();
     } catch (e: any) {
-      const diag = diagnoseError(e.message);
-      const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+      const msg = formatErrorWithDiagnosis(e);
       vscode.window.showErrorMessage(`Failed to create checkpoint: ${msg}`);
       return;
     }
@@ -1541,8 +1544,7 @@ export function registerCommands(
         );
         treeProvider.refresh();
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to create Box from checkpoint: ${msg}`);
         return;
       }
@@ -1728,8 +1730,7 @@ export function registerCommands(
             checkpointsProvider?.refresh();
             vscode.window.showInformationMessage(`Checkpoint "${chk.name}" deleted successfully.`);
           } catch (e: any) {
-            const diag = diagnoseError(e.message);
-            const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+            const msg = formatErrorWithDiagnosis(e);
             vscode.window.showErrorMessage(`Failed to delete checkpoint: ${msg}`);
           }
         }
@@ -1884,8 +1885,7 @@ export function registerCommands(
           await vscode.commands.executeCommand('boxlite.copySecretSnippet', stored.name);
         }
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to create Box with secret: ${msg}`);
       }
     })
@@ -2012,6 +2012,11 @@ export function registerCommands(
             const existingSecrets: SecretConfigSpec[] = Array.isArray(inspected.secrets) ? inspected.secrets : [];
             const otherSpecs = existingSecrets.filter((s: SecretConfigSpec) => s.name !== updated.name);
             const resolvedOthers = await secretsManager.resolveSecrets(otherSpecs);
+            if (resolvedOthers.missing.length > 0) {
+              throw new Error(
+                `Cannot replace Box "${oldBoxLabel}": missing local credential value(s) for sibling secret(s): ${resolvedOthers.missing.join(', ')}. Save them in Secrets first.`
+              );
+            }
             const mergedSecrets = [updated, ...resolvedOthers.resolved];
             const replacementName = inspected.name ? `${inspected.name}-rotated` : undefined;
             return bridge.createBox({
@@ -2022,6 +2027,11 @@ export function registerCommands(
               diskSizeGb: inspected.diskSizeGb ?? inspected.disk_size_gb,
               autoStop: inspected.autoStop ?? inspected.auto_stop,
               autoDelete: inspected.autoDelete ?? inspected.auto_delete,
+              autoResume: inspected.autoResume ?? inspected.auto_resume,
+              env: inspected.env,
+              entrypoint: inspected.entrypoint,
+              cmd: inspected.cmd,
+              volumes: inspected.volumes,
               network: inspected.network || { outbound: { mode: 'enabled' } },
               secrets: mergedSecrets
             });
@@ -2041,8 +2051,7 @@ export function registerCommands(
           vscode.window.showInformationMessage(`Removed old Box "${oldBoxLabel}".`);
         }
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to create replacement Box: ${msg}`);
       }
     })
@@ -2132,8 +2141,7 @@ export function registerCommands(
           );
         }
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to verify secret injection: ${msg}`);
       }
     })
@@ -2272,8 +2280,7 @@ export function registerCommands(
               : '';
         vscode.window.showInformationMessage(`Domain "${created.domain}" added (${created.status}).${verifyHint}`);
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to add domain: ${msg}`);
       }
     })
@@ -2301,8 +2308,7 @@ export function registerCommands(
         );
         vscode.window.showInformationMessage(`Domain "${updated.domain}" status: ${updated.status}.`);
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to verify domain: ${msg}`);
       }
     })
@@ -2370,8 +2376,7 @@ export function registerCommands(
         const routeMsg = picked.boxId ? `routed to ${picked.label}:${port}` : 'detached from Box';
         vscode.window.showInformationMessage(`Domain "${updated.domain}" ${routeMsg}.`);
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to update domain routing: ${msg}`);
       }
     })
@@ -2457,8 +2462,7 @@ export function registerCommands(
         );
         vscode.window.showInformationMessage(`Domain "${dom.domain}" deleted.`);
       } catch (e: any) {
-        const diag = diagnoseError(e.message);
-        const msg = e.message.includes('Diagnosis:') ? e.message : `${e.message}\nDiagnosis: ${diag.summary}`;
+        const msg = formatErrorWithDiagnosis(e);
         vscode.window.showErrorMessage(`Failed to delete domain: ${msg}`);
       }
     })

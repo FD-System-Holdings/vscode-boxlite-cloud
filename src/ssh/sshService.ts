@@ -1306,7 +1306,14 @@ export class SshService implements vscode.Disposable {
               return;
             }
             // Always revoke tunnel before disabling SSH per BoxLite Cloud docs
-            await this.restClient.revokeTunnel(creds.restUrl, creds.apiKey, boxId, targetPort);
+            // Ignore 404 (no active tunnel on targetPort) so disableSsh and local cleanup still run
+            try {
+              await this.restClient.revokeTunnel(creds.restUrl, creds.apiKey, boxId, targetPort);
+            } catch (revokeErr) {
+              if (!(revokeErr instanceof SshCliError && revokeErr.code === 'BOX_NOT_FOUND')) {
+                throw revokeErr;
+              }
+            }
             await this.restClient.disableSsh(creds.restUrl, creds.apiKey, boxId);
             await this.forwarderManager.stopForwarder(boxId, targetPort);
 

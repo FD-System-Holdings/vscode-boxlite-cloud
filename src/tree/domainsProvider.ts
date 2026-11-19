@@ -4,16 +4,17 @@ import { CredentialsManager } from '../auth/credentials';
 import {
   BoxLiteTreeItem,
   DomainTreeItem,
-  DomainChildTreeItem
+  DomainChildTreeItem,
+  createErrorTreeItem
 } from './nodes';
 
-export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem> {
+export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem>, vscode.Disposable {
   private _onDidChangeTreeData = new vscode.EventEmitter<BoxLiteTreeItem | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-  private cachedDomains: DomainTreeItem[] = [];
   private startupReady = true;
   private refreshTimer?: NodeJS.Timeout;
+  private disposed = false;
 
   constructor(
     private bridge: BoxLiteBridgeClient,
@@ -24,12 +25,24 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
     this.startupReady = ready;
   }
 
-  public refresh(): void {
+  private clearRefreshTimer(): void {
     if (this.refreshTimer) {
       clearTimeout(this.refreshTimer);
       this.refreshTimer = undefined;
     }
-    this._onDidChangeTreeData.fire();
+  }
+
+  public refresh(): void {
+    this.clearRefreshTimer();
+    if (!this.disposed) {
+      this._onDidChangeTreeData.fire();
+    }
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    this.clearRefreshTimer();
+    this._onDidChangeTreeData.dispose();
   }
 
   public getTreeItem(element: BoxLiteTreeItem): vscode.TreeItem {
@@ -60,7 +73,6 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
       try {
         const domains = await this.bridge.listDomains();
         if (domains.length === 0) {
-          this.cachedDomains = [];
           items.push(
             new DomainChildTreeItem(
               'No Custom Domains',
@@ -70,64 +82,34 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
             )
           );
         } else {
-          this.cachedDomains = domains.map((d) => new DomainTreeItem(d));
-          items.push(...this.cachedDomains);
+          items.push(...domains.map((d) => new DomainTreeItem(d)));
 
           const hasTransient = domains.some((d) => {
             const s = (d.status || '').toLowerCase().trim();
             return s === 'pending' || s === 'verifying' || s === 'provisioning' || s === 'deleting';
           });
-          if (hasTransient) {
-            if (this.refreshTimer) {
-              clearTimeout(this.refreshTimer);
-            }
-            this.refreshTimer = setTimeout(() => this.refresh(), 2500);
+          if (hasTransient && !this.disposed) {
+            this.clearRefreshTimer();
+            this.refreshTimer = setTimeout(() => {
+              this.refreshTimer = undefined;
+              this.refresh();
+            }, 2500);
           }
         }
       } catch (err: any) {
-        const rawMsg = err.message || '';
-        const lower = rawMsg.toLowerCase();
-        const is401 = rawMsg.includes('401') || lower.includes('unauthorized');
-        const is403 = rawMsg.includes('403') || lower.includes('forbidden');
-        const is404 = rawMsg.includes('404') || rawMsg.includes('501') || lower.includes('not found') || lower.includes('not implemented');
-
-        let desc = rawMsg;
-        let tooltip = rawMsg;
-        let command: vscode.Command = { command: 'boxlite.refreshDomains', title: 'Retry' };
-        let icon = 'warning';
-        let contextValue = 'domain-error';
-
-        if (is401) {
-          desc = '401 Unauthorized · Invalid credentials';
-          tooltip = 'BoxLite Cloud API Error (401): Unauthorized.\n\nConfigure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".';
-          command = { command: 'boxlite.setApiKey', title: 'Sign In / Set API Key' };
-          icon = 'key';
-        } else if (is403) {
-          desc = '403 Forbidden · Domains access denied';
-          tooltip = 'BoxLite Cloud API Error (403): Forbidden.\n\nEnsure your API key has permission to manage domains.';
-          icon = 'lock';
-          contextValue = 'domain-forbidden';
-        } else if (is404) {
-          desc = 'Custom Domains API unavailable on this server';
-          tooltip = 'BoxLite Cloud REST endpoint /v1/domains returned 404/501.\n\nCustom Domains may not be enabled on this BoxLite Cloud target yet. Click to retry.';
-          icon = 'info';
-          contextValue = 'domain-unavailable';
-        } else {
-          const firstLine = rawMsg.split('\n')[0];
-          desc = firstLine.length > 60 ? firstLine.slice(0, 57) + '...' : firstLine;
-        }
-
         items.push(
-          new DomainChildTreeItem(
-            'Error loading domains',
-            desc,
-            icon,
-            command,
-            vscode.TreeItemCollapsibleState.None,
-            contextValue,
-            undefined,
-            tooltip
-          )
+          createErrorTreeItem({
+            label: 'Error loading domains',
+            rawMessage: err.message || '',
+            retryCommand: 'boxlite.refreshDomains',
+            contextPrefix: 'domain',
+            forbiddenDescription: '403 Forbidden · Domains access denied',
+            forbiddenTooltip: 'BoxLite Cloud API Error (403): Forbidden.\n\nEnsure your API key has permission to manage domains.',
+            unauthorizedTooltip: 'BoxLite Cloud API Error (401): Unauthorized.\n\nConfigure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".',
+            unavailableDescription: 'Custom Domains API unavailable on this server',
+            unavailableTooltip: 'BoxLite Cloud REST endpoint /v1/domains returned 404/501.\n\nCustom Domains may not be enabled on this BoxLite Cloud target yet. Click to retry.',
+            createItem: (...args) => new DomainChildTreeItem(...args)
+          })
         );
       }
 

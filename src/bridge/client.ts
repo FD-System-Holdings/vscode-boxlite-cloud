@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import { ChildProcess, spawn } from 'child_process';
@@ -46,6 +47,7 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
   private inFlightReads = new Map<string, Promise<any>>();
   private requestCounter = 0;
   private startPromise: Promise<ChildProcess> | null = null;
+  private spawnGeneration = 0;
   private isDisposed = false;
 
   constructor(
@@ -88,7 +90,7 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
       path.join(this.context.extensionPath, 'python', 'bridge.py')
     ];
     for (const p of candidates) {
-      if (require('fs').existsSync(p)) {
+      if (fs.existsSync(p)) {
         return p;
       }
     }
@@ -104,14 +106,18 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
       return this.startPromise;
     }
 
-    this.startPromise = this.spawnBridgeProcess().finally(() => {
-      this.startPromise = null;
+    const generation = this.spawnGeneration;
+    const promise = this.spawnBridgeProcess(generation).finally(() => {
+      if (this.startPromise === promise) {
+        this.startPromise = null;
+      }
     });
+    this.startPromise = promise;
 
-    return this.startPromise;
+    return promise;
   }
 
-  private async spawnBridgeProcess(): Promise<ChildProcess> {
+  private async spawnBridgeProcess(generation: number): Promise<ChildProcess> {
     if (this.isDisposed) {
       throw new Error('Bridge client is disposed');
     }
@@ -123,6 +129,9 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
 
     if (this.isDisposed) {
       throw new Error('Bridge client is disposed');
+    }
+    if (generation !== this.spawnGeneration) {
+      throw new Error('Bridge restarted during startup');
     }
 
     const env = createCleanSubprocessEnv({
@@ -143,18 +152,31 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
       windowsHide: true
     });
 
+    if (this.isDisposed || generation !== this.spawnGeneration) {
+      try {
+        proc.kill();
+      } catch {
+        // Ignore
+      }
+      throw new Error(this.isDisposed ? 'Bridge client is disposed' : 'Bridge restarted during startup');
+    }
+
     proc.on('error', (err) => {
       this.safeLog(`[bridge] Process error: ${err.message}`);
-      this.closeReadlines();
-      this.rejectAllPending(err);
-      this.process = null;
+      if (this.process === proc) {
+        this.closeReadlines();
+        this.rejectAllPending(err);
+        this.process = null;
+      }
     });
 
     proc.on('exit', (code, signal) => {
       this.safeLog(`[bridge] Process exited with code ${code}, signal ${signal}`);
-      this.closeReadlines();
-      this.rejectAllPending(new Error(`Bridge process exited with code ${code}`));
-      this.process = null;
+      if (this.process === proc) {
+        this.closeReadlines();
+        this.rejectAllPending(new Error(`Bridge process exited with code ${code}`));
+        this.process = null;
+      }
     });
 
     if (proc.stdin) {
@@ -444,6 +466,8 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
   }
 
   public restartBridge() {
+    this.spawnGeneration++;
+    this.startPromise = null;
     this.inFlightReads.clear();
     this.closeReadlines();
     if (this.process) {

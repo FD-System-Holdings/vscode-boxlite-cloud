@@ -205,6 +205,7 @@ export async function activate(context: vscode.ExtensionContext) {
   const volumesProvider = new VolumesTreeDataProvider(bridge, credentials);
   const checkpointsProvider = new CheckpointsTreeDataProvider(bridge, credentials);
   const secretsProvider = new SecretsTreeDataProvider(bridge, credentials, secretsManager);
+  context.subscriptions.push(treeProvider, domainsProvider, volumesProvider, checkpointsProvider);
 
   const allProviders = [
     accountProvider,
@@ -315,6 +316,10 @@ export async function activate(context: vscode.ExtensionContext) {
         e.affectsConfiguration('boxlite.customImages')
       ) {
         imagesProvider.refresh();
+      }
+      if (e.affectsConfiguration('boxlite.pythonPath')) {
+        envManager.invalidateCache();
+        bridge.restartBridge();
       }
     })
   );

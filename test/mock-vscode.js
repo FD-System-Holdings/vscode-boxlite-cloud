@@ -119,6 +119,9 @@ const mockVscode = {
     fire(data) {
       if (this.listener) this.listener(data);
     }
+    dispose() {
+      this.listener = undefined;
+    }
   },
   Disposable: class {
     dispose() {}

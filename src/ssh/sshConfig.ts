@@ -275,10 +275,19 @@ export function removeAllManagedBlocks(configText: string): { content: string; r
     return { content: configText, removedCount: 0 };
   }
 
+  const eol = detectEol(configText);
   let current = configText;
-  for (const span of spans) {
-    const res = removeBlock(current, span.boxId);
-    current = res.content;
+  for (let i = spans.length - 1; i >= 0; i--) {
+    const span = spans[i];
+    const before = current.slice(0, span.startIndex).replace(/[ \t\r\n]+$/, '');
+    const after = current.slice(span.endIndex).replace(/^[ \t\r\n]+/, '');
+    if (before && after) {
+      current = `${before}${eol}${eol}${after}`;
+    } else if (before) {
+      current = `${before}${eol}`;
+    } else {
+      current = after;
+    }
   }
 
   return { content: current, removedCount: spans.length };

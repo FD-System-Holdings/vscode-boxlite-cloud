@@ -4,15 +4,17 @@ import { CredentialsManager } from '../auth/credentials';
 import {
   BoxLiteTreeItem,
   VolumeTreeItem,
-  VolumeChildTreeItem
+  VolumeChildTreeItem,
+  createErrorTreeItem
 } from './nodes';
 
-export class VolumesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem> {
+export class VolumesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem>, vscode.Disposable {
   private _onDidChangeTreeData = new vscode.EventEmitter<BoxLiteTreeItem | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-  private cachedVolumes: VolumeTreeItem[] = [];
   private startupReady = true;
+  private refreshTimer?: NodeJS.Timeout;
+  private disposed = false;
 
   constructor(
     private bridge: BoxLiteBridgeClient,
@@ -23,8 +25,24 @@ export class VolumesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
     this.startupReady = ready;
   }
 
+  private clearRefreshTimer(): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
+  }
+
   public refresh(): void {
-    this._onDidChangeTreeData.fire();
+    this.clearRefreshTimer();
+    if (!this.disposed) {
+      this._onDidChangeTreeData.fire();
+    }
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    this.clearRefreshTimer();
+    this._onDidChangeTreeData.dispose();
   }
 
   public getTreeItem(element: BoxLiteTreeItem): vscode.TreeItem {
@@ -65,51 +83,33 @@ export class VolumesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
             )
           );
         } else {
-          this.cachedVolumes = volumes.map((v) => new VolumeTreeItem(v));
-          items.push(...this.cachedVolumes);
+          items.push(...volumes.map((v) => new VolumeTreeItem(v)));
 
           // Auto-refresh if any volume is in a transient state
           const hasTransient = volumes.some((v) => {
             const s = (v.state || '').toLowerCase().trim();
             return s === 'creating' || s === 'pending_create' || s === 'deleting' || s === 'pending_delete';
           });
-          if (hasTransient) {
-            setTimeout(() => this.refresh(), 1500);
+          if (hasTransient && !this.disposed) {
+            this.clearRefreshTimer();
+            this.refreshTimer = setTimeout(() => {
+              this.refreshTimer = undefined;
+              this.refresh();
+            }, 1500);
           }
         }
       } catch (err: any) {
-        const rawMsg = err.message || '';
-        const is403 = rawMsg.includes('403') || rawMsg.toLowerCase().includes('forbidden');
-        const is401 = rawMsg.includes('401') || rawMsg.toLowerCase().includes('unauthorized');
-
-        let desc = rawMsg;
-        let tooltip = rawMsg;
-        let command = { command: 'boxlite.refreshVolumes', title: 'Retry' };
-
-        if (is403) {
-          desc = '403 Forbidden · Managed volumes not permitted (agent.md §4)';
-          tooltip = `BoxLite Cloud API Error (403): Forbidden resource.\n\nDiagnosis (agent.md §5):\nCheck authentication/token and requested URL; do not assume either app health or one particular policy cause.\n\nNote (agent.md §4):\nDo not infer managed database or shared-volume support. BoxLite Cloud may restrict or not support shared volumes for your account tier. Click to retry.`;
-        } else if (is401) {
-          desc = '401 Unauthorized · Invalid credentials';
-          tooltip = `BoxLite Cloud API Error (401): Unauthorized.\n\nDiagnosis (agent.md §5):\nCheck credentials. Configure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".`;
-          command = { command: 'boxlite.setApiKey', title: 'Sign In / Set API Key' };
-        } else {
-          const firstLine = rawMsg.split('\n')[0];
-          desc = firstLine.length > 60 ? firstLine.slice(0, 57) + '...' : firstLine;
-          tooltip = rawMsg;
-        }
-
         items.push(
-          new VolumeChildTreeItem(
-            'Error loading volumes',
-            desc,
-            is403 ? 'lock' : (is401 ? 'key' : 'warning'),
-            command,
-            vscode.TreeItemCollapsibleState.None,
-            is403 ? 'volume-forbidden' : 'volume-error',
-            undefined,
-            tooltip
-          )
+          createErrorTreeItem({
+            label: 'Error loading volumes',
+            rawMessage: err.message || '',
+            retryCommand: 'boxlite.refreshVolumes',
+            contextPrefix: 'volume',
+            forbiddenDescription: '403 Forbidden · Managed volumes not permitted (agent.md §4)',
+            forbiddenTooltip: `BoxLite Cloud API Error (403): Forbidden resource.\n\nDiagnosis (agent.md §5):\nCheck authentication/token and requested URL; do not assume either app health or one particular policy cause.\n\nNote (agent.md §4):\nDo not infer managed database or shared-volume support. BoxLite Cloud may restrict or not support shared volumes for your account tier. Click to retry.`,
+            unauthorizedTooltip: `BoxLite Cloud API Error (401): Unauthorized.\n\nDiagnosis (agent.md §5):\nCheck credentials. Configure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".`,
+            createItem: (...args) => new VolumeChildTreeItem(...args)
+          })
         );
       }
 

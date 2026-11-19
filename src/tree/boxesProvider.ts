@@ -5,12 +5,13 @@ import { LogStreamManager } from '../logs/logStream';
 import { SshStore } from '../ssh/sshStore';
 import { BoxLiteTreeItem, BoxTreeItem, BoxChildTreeItem } from './nodes';
 
-export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem> {
+export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem>, vscode.Disposable {
   private _onDidChangeTreeData = new vscode.EventEmitter<BoxLiteTreeItem | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-  private cachedBoxes: BoxTreeItem[] = [];
   private startupReady = true;
+  private refreshTimer?: NodeJS.Timeout;
+  private disposed = false;
 
   constructor(
     private bridge: BoxLiteBridgeClient,
@@ -23,8 +24,24 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
     this.startupReady = ready;
   }
 
+  private clearRefreshTimer(): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
+  }
+
   public refresh(): void {
-    this._onDidChangeTreeData.fire();
+    this.clearRefreshTimer();
+    if (!this.disposed) {
+      this._onDidChangeTreeData.fire();
+    }
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    this.clearRefreshTimer();
+    this._onDidChangeTreeData.dispose();
   }
 
   public getTreeItem(element: BoxLiteTreeItem): vscode.TreeItem {
@@ -56,7 +73,6 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
       try {
         const boxes = await this.bridge.listBoxes();
         if (boxes.length === 0) {
-          this.cachedBoxes = [];
           items.push(
             new BoxChildTreeItem(
               'No Managed Boxes',
@@ -66,16 +82,19 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
             )
           );
         } else {
-          this.cachedBoxes = boxes.map((b) => new BoxTreeItem(b, this.sshStore?.isBoxSshReadySync(b.id) ?? false));
-          items.push(...this.cachedBoxes);
+          items.push(...boxes.map((b) => new BoxTreeItem(b, this.sshStore?.isBoxSshReadySync(b.id) ?? false)));
 
           // Auto-refresh if any box is transitioning (e.g. stopping or starting)
           const hasTransient = boxes.some((b) => {
             const s = (b.status || '').toLowerCase().trim();
             return s === 'stopping' || s === 'starting' || s === 'provisioning';
           });
-          if (hasTransient) {
-            setTimeout(() => this.refresh(), 1500);
+          if (hasTransient && !this.disposed) {
+            this.clearRefreshTimer();
+            this.refreshTimer = setTimeout(() => {
+              this.refreshTimer = undefined;
+              this.refresh();
+            }, 1500);
           }
         }
       } catch (err: any) {

@@ -21,7 +21,7 @@ interface ProxySecretsPayload {
 export class SecretsManager {
   private secretStorage: vscode.SecretStorage;
   private cachedPayload?: ProxySecretsPayload;
-  private loadPromise?: Promise<ProxySecretsPayload>;
+  private loadPromise?: Promise<{ payload: ProxySecretsPayload; error?: unknown }>;
 
   constructor(context: vscode.ExtensionContext) {
     this.secretStorage = context.secrets;
@@ -42,47 +42,50 @@ export class SecretsManager {
     };
   }
 
-  private async load(): Promise<ProxySecretsPayload> {
+  private async load(throwOnError = false): Promise<ProxySecretsPayload> {
     if (this.cachedPayload) {
       return this.clonePayload(this.cachedPayload);
     }
 
-    if (this.loadPromise) {
-      return this.clonePayload(await this.loadPromise);
+    if (!this.loadPromise) {
+      this.loadPromise = this.performLoad().finally(() => {
+        this.loadPromise = undefined;
+      });
     }
 
-    this.loadPromise = this.performLoad();
-    try {
-      const loaded = await this.loadPromise;
-      this.cachedPayload = this.clonePayload(loaded);
-      return this.clonePayload(loaded);
-    } finally {
-      this.loadPromise = undefined;
+    const result = await this.loadPromise;
+    if (!result.error) {
+      this.cachedPayload = this.clonePayload(result.payload);
+    } else if (throwOnError) {
+      throw result.error;
     }
+    return this.clonePayload(result.payload);
   }
 
-  private async performLoad(): Promise<ProxySecretsPayload> {
+  private async performLoad(): Promise<{ payload: ProxySecretsPayload; error?: unknown }> {
+    let raw: string | undefined;
     try {
-      const raw = await this.secretStorage.get(SECRET_KEY_PROXY_SECRETS);
-      if (raw) {
+      raw = await this.secretStorage.get(SECRET_KEY_PROXY_SECRETS);
+    } catch (err) {
+      return { payload: { secrets: [] }, error: err };
+    }
+
+    if (raw) {
+      try {
         const parsed: ProxySecretsPayload = JSON.parse(raw);
         if (parsed && Array.isArray(parsed.secrets)) {
-          return parsed;
+          return { payload: parsed };
         }
+      } catch (err) {
+        return { payload: { secrets: [] }, error: err };
       }
-    } catch {
-      // Ignore malformed storage payload or transient SecretStorage errors
     }
-    return { secrets: [] };
+    return { payload: { secrets: [] } };
   }
 
   private async save(payload: ProxySecretsPayload): Promise<void> {
+    await this.secretStorage.store(SECRET_KEY_PROXY_SECRETS, JSON.stringify(payload));
     this.cachedPayload = this.clonePayload(payload);
-    try {
-      await this.secretStorage.store(SECRET_KEY_PROXY_SECRETS, JSON.stringify(payload));
-    } catch {
-      // Preserve in-memory cache if SecretStorage IPC is unavailable
-    }
   }
 
   public async listSecrets(): Promise<StoredProxySecret[]> {
@@ -118,7 +121,7 @@ export class SecretsManager {
     }
 
     const now = new Date().toISOString();
-    const data = await this.load();
+    const data = await this.load(true);
     const existingIdx = data.secrets.findIndex(
       (s) => s.name.trim().toLowerCase() === trimmedName.toLowerCase()
     );
@@ -144,7 +147,7 @@ export class SecretsManager {
 
   public async removeSecret(name: string): Promise<boolean> {
     const normalized = name.trim().toLowerCase();
-    const data = await this.load();
+    const data = await this.load(true);
     const idx = data.secrets.findIndex((s) => s.name.trim().toLowerCase() === normalized);
     if (idx === -1) {
       return false;

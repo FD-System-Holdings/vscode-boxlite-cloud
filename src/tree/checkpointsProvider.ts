@@ -5,15 +5,17 @@ import {
   BoxLiteTreeItem,
   CheckpointTreeItem,
   CheckpointChildTreeItem,
-  formatBytes
+  formatBytes,
+  createErrorTreeItem
 } from './nodes';
 
-export class CheckpointsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem> {
+export class CheckpointsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem>, vscode.Disposable {
   private _onDidChangeTreeData = new vscode.EventEmitter<BoxLiteTreeItem | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-  private cachedCheckpoints: CheckpointTreeItem[] = [];
   private startupReady = true;
+  private refreshTimer?: NodeJS.Timeout;
+  private disposed = false;
 
   constructor(
     private bridge: BoxLiteBridgeClient,
@@ -24,8 +26,24 @@ export class CheckpointsTreeDataProvider implements vscode.TreeDataProvider<BoxL
     this.startupReady = ready;
   }
 
+  private clearRefreshTimer(): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
+  }
+
   public refresh(): void {
-    this._onDidChangeTreeData.fire();
+    this.clearRefreshTimer();
+    if (!this.disposed) {
+      this._onDidChangeTreeData.fire();
+    }
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    this.clearRefreshTimer();
+    this._onDidChangeTreeData.dispose();
   }
 
   public getTreeItem(element: BoxLiteTreeItem): vscode.TreeItem {
@@ -56,7 +74,6 @@ export class CheckpointsTreeDataProvider implements vscode.TreeDataProvider<BoxL
       try {
         const checkpoints = await this.bridge.listCheckpoints();
         if (checkpoints.length === 0) {
-          this.cachedCheckpoints = [];
           items.push(
             new CheckpointChildTreeItem(
               'No Managed Checkpoints',
@@ -66,51 +83,32 @@ export class CheckpointsTreeDataProvider implements vscode.TreeDataProvider<BoxL
             )
           );
         } else {
-          this.cachedCheckpoints = checkpoints.map((c) => new CheckpointTreeItem(c));
-          items.push(...this.cachedCheckpoints);
+          items.push(...checkpoints.map((c) => new CheckpointTreeItem(c)));
 
           // Auto-refresh if any checkpoint is in a transient state
           const hasTransient = checkpoints.some((c) => {
             const s = (c.state || '').toLowerCase().trim();
             return s === 'creating' || s === 'pending_create' || s === 'deleting' || s === 'pending_delete';
           });
-          if (hasTransient) {
-            setTimeout(() => this.refresh(), 1500);
+          if (hasTransient && !this.disposed) {
+            this.clearRefreshTimer();
+            this.refreshTimer = setTimeout(() => {
+              this.refreshTimer = undefined;
+              this.refresh();
+            }, 1500);
           }
         }
       } catch (err: any) {
-        const rawMsg = err.message || '';
-        const is403 = rawMsg.includes('403') || rawMsg.toLowerCase().includes('forbidden');
-        const is401 = rawMsg.includes('401') || rawMsg.toLowerCase().includes('unauthorized');
-
-        let desc = rawMsg;
-        let tooltip = rawMsg;
-        let command = { command: 'boxlite.refreshCheckpoints', title: 'Retry' };
-
-        if (is403) {
-          desc = '403 Forbidden · Insufficient permissions for checkpoints';
-          tooltip = `BoxLite Cloud API Error (403): Forbidden resource.\n\nEnsure your API key has permission to manage boxes and checkpoints (docs.boxlite.ai/cloud/checkpoints). Click to retry.`;
-        } else if (is401) {
-          desc = '401 Unauthorized · Invalid credentials';
-          tooltip = `BoxLite Cloud API Error (401): Unauthorized.\n\nCheck credentials. Configure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".`;
-          command = { command: 'boxlite.setApiKey', title: 'Sign In / Set API Key' };
-        } else {
-          const firstLine = rawMsg.split('\n')[0];
-          desc = firstLine.length > 60 ? firstLine.slice(0, 57) + '...' : firstLine;
-          tooltip = rawMsg;
-        }
-
         items.push(
-          new CheckpointChildTreeItem(
-            'Error loading checkpoints',
-            desc,
-            is403 ? 'lock' : (is401 ? 'key' : 'warning'),
-            command,
-            vscode.TreeItemCollapsibleState.None,
-            is403 ? 'checkpoint-forbidden' : 'checkpoint-error',
-            undefined,
-            tooltip
-          )
+          createErrorTreeItem({
+            label: 'Error loading checkpoints',
+            rawMessage: err.message || '',
+            retryCommand: 'boxlite.refreshCheckpoints',
+            contextPrefix: 'checkpoint',
+            forbiddenDescription: '403 Forbidden · Insufficient permissions for checkpoints',
+            forbiddenTooltip: `BoxLite Cloud API Error (403): Forbidden resource.\n\nEnsure your API key has permission to manage boxes and checkpoints (docs.boxlite.ai/cloud/checkpoints). Click to retry.`,
+            createItem: (...args) => new CheckpointChildTreeItem(...args)
+          })
         );
       }
 

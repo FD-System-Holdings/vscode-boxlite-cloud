@@ -16,6 +16,11 @@ export class PythonEnvManager {
     this.outputChannel = outputChannel;
   }
 
+  public invalidateCache(): void {
+    this.cachedPythonPath = null;
+    this.resolvePythonPathPromise = null;
+  }
+
   public async getPythonPath(): Promise<string> {
     if (this.cachedPythonPath) {
       return this.cachedPythonPath;
@@ -172,6 +177,7 @@ export class PythonEnvManager {
           );
         }
 
+        this.cachedPythonPath = pythonExecutable;
         this.safeAppendLine('[setup] Python environment setup complete!');
         vscode.window.showInformationMessage('BoxLite Python environment successfully configured.');
         return pythonExecutable;

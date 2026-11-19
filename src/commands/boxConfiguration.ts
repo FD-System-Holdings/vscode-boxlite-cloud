@@ -520,12 +520,17 @@ export async function showBoxConfigurationWizard(
         vscode.window.showErrorMessage(`Invalid network policy: ${netRes.errors.join('; ')}`);
         continue;
       }
+      let hasSecretError = false;
       for (const s of current.secrets || []) {
         const sCheck = validateSecretSpec(s, true);
         if (!sCheck.valid) {
           vscode.window.showErrorMessage(`Invalid secret "${s.name}": ${sCheck.error}`);
-          continue;
+          hasSecretError = true;
+          break;
         }
+      }
+      if (hasSecretError) {
+        continue;
       }
       const envSecretCheck = validateEnvAgainstSecrets(current.env, current.secrets || []);
       if (!envSecretCheck.valid) {

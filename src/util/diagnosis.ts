@@ -3,6 +3,15 @@ export interface DiagnosticMessage {
   checklist: string[];
 }
 
+export function formatErrorWithDiagnosis(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err ?? '');
+  if (message.includes('Diagnosis:')) {
+    return message;
+  }
+  const diag = diagnoseError(message);
+  return `${message}\nDiagnosis: ${diag.summary}`;
+}
+
 export function diagnoseError(errorMessage: string, code?: string): DiagnosticMessage {
   const lower = errorMessage.toLowerCase();
 

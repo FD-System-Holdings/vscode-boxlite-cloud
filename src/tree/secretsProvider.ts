@@ -51,9 +51,14 @@ export class SecretsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
 
       const merged = new Map<string, SecretTreeItemData>();
 
-      try {
-        const stored = await this.secretsManager.listSecrets();
-        for (const s of stored) {
+      const [storedRes, projectRes, boxesRes] = await Promise.allSettled([
+        this.secretsManager.listSecrets(),
+        ProjectManager.findProjectConfig(),
+        this.bridge.listBoxes()
+      ]);
+
+      if (storedRes.status === 'fulfilled') {
+        for (const s of storedRes.value) {
           const key = s.name.trim().toLowerCase();
           merged.set(key, {
             name: s.name,
@@ -65,13 +70,10 @@ export class SecretsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
             source: 'workstation'
           });
         }
-      } catch {
-        // Ignore SecretStorage read errors
       }
 
-      try {
-        const projectInfo = await ProjectManager.findProjectConfig();
-        const projectSecrets = projectInfo?.config.secrets || [];
+      if (projectRes.status === 'fulfilled') {
+        const projectSecrets = projectRes.value?.config.secrets || [];
         for (const ps of projectSecrets) {
           const key = ps.name.trim().toLowerCase();
           const existing = merged.get(key);
@@ -93,13 +95,10 @@ export class SecretsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
             });
           }
         }
-      } catch {
-        // Ignore missing/invalid boxlite.json
       }
 
-      try {
-        const boxes = await this.bridge.listBoxes();
-        for (const b of boxes) {
+      if (boxesRes.status === 'fulfilled') {
+        for (const b of boxesRes.value) {
           for (const bs of b.secrets || []) {
             const key = bs.name.trim().toLowerCase();
             const existing = merged.get(key);
@@ -118,8 +117,6 @@ export class SecretsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
             }
           }
         }
-      } catch {
-        // Gracefully ignore box listing errors in Secrets view
       }
 
       const secretItems = Array.from(merged.values()).sort((a, b) => a.name.localeCompare(b.name));

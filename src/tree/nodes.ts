@@ -527,3 +527,74 @@ export class DomainChildTreeItem extends BoxLiteTreeItem {
     this.contextValue = contextValue;
   }
 }
+
+export interface ErrorTreeItemOptions<T extends BoxLiteTreeItem> {
+  label: string;
+  rawMessage: string;
+  retryCommand: string;
+  contextPrefix: string;
+  forbiddenDescription: string;
+  forbiddenTooltip: string;
+  unauthorizedTooltip?: string;
+  unavailableDescription?: string;
+  unavailableTooltip?: string;
+  createItem: (
+    label: string,
+    description: string,
+    icon: string,
+    command: vscode.Command,
+    collapsible: vscode.TreeItemCollapsibleState,
+    contextValue: string,
+    key: undefined,
+    tooltip: string
+  ) => T;
+}
+
+export function createErrorTreeItem<T extends BoxLiteTreeItem>(opts: ErrorTreeItemOptions<T>): T {
+  const rawMsg = opts.rawMessage || '';
+  const lower = rawMsg.toLowerCase();
+  const is401 = rawMsg.includes('401') || lower.includes('unauthorized');
+  const is403 = rawMsg.includes('403') || lower.includes('forbidden');
+  const isUnavailable =
+    Boolean(opts.unavailableDescription) &&
+    (rawMsg.includes('404') || rawMsg.includes('501') || lower.includes('not found') || lower.includes('not implemented'));
+
+  let desc: string;
+  let tooltip = rawMsg;
+  let command: vscode.Command = { command: opts.retryCommand, title: 'Retry' };
+  let icon = 'warning';
+  let contextValue = `${opts.contextPrefix}-error`;
+
+  if (is403) {
+    desc = opts.forbiddenDescription;
+    tooltip = opts.forbiddenTooltip;
+    icon = 'lock';
+    contextValue = `${opts.contextPrefix}-forbidden`;
+  } else if (is401) {
+    desc = '401 Unauthorized · Invalid credentials';
+    tooltip =
+      opts.unauthorizedTooltip ||
+      'BoxLite Cloud API Error (401): Unauthorized.\n\nCheck credentials. Configure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".';
+    command = { command: 'boxlite.setApiKey', title: 'Sign In / Set API Key' };
+    icon = 'key';
+  } else if (isUnavailable && opts.unavailableDescription) {
+    desc = opts.unavailableDescription;
+    tooltip = opts.unavailableTooltip || rawMsg;
+    icon = 'info';
+    contextValue = `${opts.contextPrefix}-unavailable`;
+  } else {
+    const firstLine = rawMsg.split('\n')[0];
+    desc = firstLine.length > 60 ? firstLine.slice(0, 57) + '...' : firstLine;
+  }
+
+  return opts.createItem(
+    opts.label,
+    desc,
+    icon,
+    command,
+    vscode.TreeItemCollapsibleState.None,
+    contextValue,
+    undefined,
+    tooltip
+  );
+}

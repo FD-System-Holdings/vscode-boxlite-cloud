@@ -1056,7 +1056,6 @@
     "test": "tsc -p ./tsconfig.test.json && mocha -r test/mock-vscode.js out/test/**/*.test.js"
   },
   "devDependencies": {
-    "@types/jest": "^30.0.0",
     "@types/mocha": "^10.0.6",
     "@types/node": "^20.19.43",
     "@types/vscode": "^1.80.0",

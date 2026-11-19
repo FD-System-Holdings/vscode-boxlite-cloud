@@ -17,7 +17,7 @@ interface ApiKeysPayload {
 export class CredentialsManager {
   private secretStorage: vscode.SecretStorage;
   private cachedPayload?: ApiKeysPayload;
-  private loadPromise?: Promise<ApiKeysPayload>;
+  private loadPromise?: Promise<{ payload: ApiKeysPayload; error?: unknown }>;
 
   constructor(context: vscode.ExtensionContext) {
     this.secretStorage = context.secrets;
@@ -35,35 +35,44 @@ export class CredentialsManager {
     };
   }
 
-  private async load(): Promise<ApiKeysPayload> {
+  private async load(throwOnError = false): Promise<ApiKeysPayload> {
     if (this.cachedPayload) {
       return this.clonePayload(this.cachedPayload);
     }
 
-    if (this.loadPromise) {
-      return this.clonePayload(await this.loadPromise);
+    if (!this.loadPromise) {
+      this.loadPromise = this.performLoad().finally(() => {
+        this.loadPromise = undefined;
+      });
     }
 
-    this.loadPromise = this.performLoad();
-    try {
-      const loaded = await this.loadPromise;
-      this.cachedPayload = this.clonePayload(loaded);
-      return this.clonePayload(loaded);
-    } finally {
-      this.loadPromise = undefined;
+    const result = await this.loadPromise;
+    if (!result.error) {
+      this.cachedPayload = this.clonePayload(result.payload);
+    } else if (throwOnError) {
+      throw result.error;
     }
+    return this.clonePayload(result.payload);
   }
 
-  private async performLoad(): Promise<ApiKeysPayload> {
+  private async performLoad(): Promise<{ payload: ApiKeysPayload; error?: unknown }> {
+    let raw: string | undefined;
     try {
-      const raw = await this.secretStorage.get(SECRET_KEY_API_KEYS);
-      if (raw) {
+      raw = await this.secretStorage.get(SECRET_KEY_API_KEYS);
+    } catch (err) {
+      return { payload: { keys: [] }, error: err };
+    }
+
+    if (raw) {
+      try {
         const parsed: ApiKeysPayload = JSON.parse(raw);
         if (parsed && Array.isArray(parsed.keys)) {
-          return parsed;
+          return { payload: parsed };
         }
+      } catch (err) {
+        return { payload: { keys: [] }, error: err };
       }
-    } catch {}
+    }
 
     // Migration: migrate legacy single-key storage if present
     try {
@@ -77,20 +86,18 @@ export class CredentialsManager {
         try {
           await this.secretStorage.delete(LEGACY_SECRET_KEY_API_KEY);
         } catch {}
-        return migrated;
+        return { payload: migrated };
       }
-    } catch {}
+    } catch (err) {
+      return { payload: { keys: [] }, error: err };
+    }
 
-    return { keys: [] };
+    return { payload: { keys: [] } };
   }
 
   private async save(payload: ApiKeysPayload): Promise<void> {
+    await this.secretStorage.store(SECRET_KEY_API_KEYS, JSON.stringify(payload));
     this.cachedPayload = this.clonePayload(payload);
-    try {
-      await this.secretStorage.store(SECRET_KEY_API_KEYS, JSON.stringify(payload));
-    } catch {
-      // Preserve in-memory cache if SecretStorage IPC is unavailable
-    }
   }
 
   public async getApiKey(): Promise<string | undefined> {
@@ -159,7 +166,7 @@ export class CredentialsManager {
       throw new Error('API key name cannot be empty');
     }
 
-    const data = await this.load();
+    const data = await this.load(true);
     if (data.keys.some((k) => k.name.toLowerCase() === trimmedName.toLowerCase())) {
       throw new Error(`An API key with the name "${trimmedName}" already exists.`);
     }
@@ -172,7 +179,7 @@ export class CredentialsManager {
   }
 
   public async selectKey(id: string): Promise<boolean> {
-    const data = await this.load();
+    const data = await this.load(true);
     const found = data.keys.find((k) => k.id === id);
     if (!found) {
       return false;
@@ -183,7 +190,7 @@ export class CredentialsManager {
   }
 
   public async removeKey(id: string): Promise<boolean> {
-    const data = await this.load();
+    const data = await this.load(true);
     const idx = data.keys.findIndex((k) => k.id === id);
     if (idx === -1) {
       return false;
@@ -197,7 +204,7 @@ export class CredentialsManager {
   }
 
   public async setApiKey(apiKey: string, name?: string): Promise<void> {
-    const data = await this.load();
+    const data = await this.load(true);
     const keyName = name && name.trim().length > 0 ? name.trim() : (data.keys.length === 0 ? 'Default' : `Key ${data.keys.length + 1}`);
     const existing = data.keys.find((k) => k.name.toLowerCase() === keyName.toLowerCase());
     if (existing) {
@@ -210,7 +217,7 @@ export class CredentialsManager {
   }
 
   public async clearApiKey(): Promise<void> {
-    const data = await this.load();
+    const data = await this.load(true);
     if (data.activeId) {
       await this.removeKey(data.activeId);
     } else if (data.keys.length > 0) {
