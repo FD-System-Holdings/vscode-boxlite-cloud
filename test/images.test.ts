@@ -13,7 +13,16 @@ import {
   buildImageList,
   BUILTIN_IMAGES
 } from '../src/tree/imagesProvider';
+import { BoxesTreeDataProvider } from '../src/tree/boxesProvider';
+import { BoxLiteBridgeClient } from '../src/bridge/client';
 import { BoxListItem, ImageItem } from '../src/bridge/protocol';
+import {
+  ImagePullFailureError,
+  launchBoxFromOwnImage,
+  pollCatalogForImage,
+  runUseYourOwnImageFlow
+} from '../src/images/customImageWorkflow';
+import { registerCommands } from '../src/commands';
 
 describe('Images List Building and Sorting', () => {
   it('should include 4 built-in images and flag default image', () => {
@@ -455,5 +464,393 @@ describe('Package.json Images UI Contribution Specifications', () => {
 
     assert.ok(props['boxlite.defaultImage'], 'Expected boxlite.defaultImage configuration property');
     assert.strictEqual(props['boxlite.defaultImage'].default, 'python');
+  });
+});
+
+describe('Use Your Own Image Workflow (Zero-CLI Built-in API)', () => {
+  const sampleDigest =
+    'sha256:c64c687cbea90123456789abcdef0123456789abcdef0123456789abcdef0123';
+
+  it('deduplicates digest-pinned box readbacks and saved custom refs against catalog records in buildImageList', () => {
+    const catalogImages: ImageItem[] = [
+      { name: 'docker.io/library/alpine', sizeBytes: 3630321 }
+    ];
+    const activeBoxes: BoxListItem[] = [
+      {
+        id: 'box_digest_1',
+        name: 'demo',
+        status: 'running',
+        image: `docker.io/library/alpine@${sampleDigest}`
+      }
+    ];
+    const savedCustom = ['docker.io/library/alpine:3.20', 'alpine'];
+
+    const result = buildImageList(catalogImages, BUILTIN_IMAGES, savedCustom, activeBoxes, 'python');
+
+    assert.strictEqual(result.catalog.length, 1);
+    assert.strictEqual(result.catalog[0].name, 'docker.io/library/alpine');
+    assert.strictEqual(result.catalog[0].boxCount, 1);
+    assert.strictEqual(result.catalog[0].digest, sampleDigest);
+    assert.strictEqual(result.customOnly.length, 0);
+  });
+
+  it('polls the image catalog until boot recording appears and captures box digest readback', async () => {
+    let listCalls = 0;
+    const mockBridge = {
+      listImages: async () => {
+        listCalls++;
+        if (listCalls < 3) {
+          return { images: [], usage: { count: 0, limit: 20, knownBytes: 0 } };
+        }
+        return {
+          images: [{ name: 'docker.io/library/alpine', sizeBytes: 3630321 }],
+          usage: { count: 1, limit: 20, knownBytes: 3630321 }
+        };
+      },
+      inspectBox: async () => ({
+        id: 'box_demo_1',
+        image: `docker.io/library/alpine@${sampleDigest}`
+      }),
+      inspectImage: async () => ({
+        name: 'docker.io/library/alpine',
+        versions: [{ digest: sampleDigest, sizeBytes: 3630321 }],
+        aliases: [],
+        history: []
+      })
+    } as unknown as BoxLiteBridgeClient;
+
+    const result = await pollCatalogForImage(mockBridge, 'docker.io/library/alpine:3.20', 'box_demo_1', {
+      maxAttempts: 5,
+      intervalMs: 0,
+      sleep: async () => {}
+    });
+
+    assert.strictEqual(result.recorded, true);
+    assert.strictEqual(result.attempts, 3);
+    assert.strictEqual(result.catalogImage?.name, 'docker.io/library/alpine');
+    assert.strictEqual(result.digest, sampleDigest);
+    assert.strictEqual(result.resolvedBoxImage, `docker.io/library/alpine@${sampleDigest}`);
+    assert.strictEqual(result.usage?.count, 1);
+  });
+
+  it('skips catalog polling for built-in images and honors cancellation/timeout', async () => {
+    let listCalled = false;
+    const builtinBridge = {
+      listImages: async () => {
+        listCalled = true;
+        return { images: [] };
+      },
+      inspectBox: async () => ({ id: 'box_py', image: 'python' })
+    } as unknown as BoxLiteBridgeClient;
+
+    const builtinRes = await pollCatalogForImage(builtinBridge, 'python', 'box_py');
+    assert.strictEqual(listCalled, false);
+    assert.strictEqual(builtinRes.recorded, false);
+    assert.strictEqual(builtinRes.attempts, 0);
+
+    let cancelAttempts = 0;
+    const cancelRes = await pollCatalogForImage(
+      {
+        listImages: async () => {
+          cancelAttempts++;
+          return { images: [] };
+        },
+        inspectBox: async () => ({ id: 'box_2', image: 'docker.io/library/alpine:3.20' })
+      } as unknown as BoxLiteBridgeClient,
+      'docker.io/library/alpine:3.20',
+      'box_2',
+      {
+        maxAttempts: 5,
+        intervalMs: 0,
+        isCancelled: () => cancelAttempts >= 1
+      }
+    );
+    assert.strictEqual(cancelRes.recorded, false);
+    assert.strictEqual(cancelRes.attempts, 1);
+  });
+
+  it('cleans up leftover failed boxes by name on image pull failure, but not on 409/limit errors', async () => {
+    const removedTargets: Array<{ target: string; opts: any }> = [];
+    const pullErr = new Error(
+      "Box state transition failed: Failed to pull image 'acme/api:1.4.0': docker.io refused the pull (UNAUTHORIZED)."
+    );
+
+    const failingPullBridge = {
+      createBox: async () => {
+        throw pullErr;
+      },
+      removeBox: async (target: string, opts: any) => {
+        removedTargets.push({ target, opts });
+        return { boxId: 'box_orphan', removed: true };
+      }
+    } as unknown as BoxLiteBridgeClient;
+
+    await assert.rejects(
+      () =>
+        launchBoxFromOwnImage(failingPullBridge, {
+          name: 'demo-orphan',
+          image: 'acme/api:1.4.0'
+        }),
+      (err: any) => {
+        assert.ok(err instanceof ImagePullFailureError);
+        assert.strictEqual(err.boxName, 'demo-orphan');
+        assert.strictEqual(err.cleanedUp, true);
+        assert.strictEqual(err.diagnosis.summary, 'Image Pull Failed');
+        return true;
+      }
+    );
+    assert.strictEqual(removedTargets.length, 1);
+    assert.strictEqual(removedTargets[0].target, 'demo-orphan');
+    assert.strictEqual(removedTargets[0].opts?.ignoreNotFound, true);
+
+    // 409 Conflict must NEVER delete an existing box
+    const conflictRemovals: string[] = [];
+    const conflictBridge = {
+      createBox: async () => {
+        throw new Error('409 Conflict: box name already exists');
+      },
+      removeBox: async (target: string) => {
+        conflictRemovals.push(target);
+        return { boxId: target, removed: true };
+      }
+    } as unknown as BoxLiteBridgeClient;
+
+    await assert.rejects(
+      () =>
+        launchBoxFromOwnImage(conflictBridge, {
+          name: 'existing-prod-box',
+          image: 'docker.io/library/alpine:3.20'
+        }),
+      /409 Conflict/
+    );
+    assert.strictEqual(conflictRemovals.length, 0);
+  });
+
+  it('runs end-to-end Use Your Own Image flow (Docker Hub vs built-in warning, create, poll, and pin alias)', async () => {
+    const vscode = require('vscode');
+    const origGetConfiguration = vscode.workspace.getConfiguration;
+    const origShowInputBox = vscode.window.showInputBox;
+    const origShowQuickPick = vscode.window.showQuickPick;
+    const origShowWarningMessage = vscode.window.showWarningMessage;
+    const origShowInformationMessage = vscode.window.showInformationMessage;
+    const origShowErrorMessage = vscode.window.showErrorMessage;
+
+    const savedCustomImages: string[] = [];
+    const createdBoxArgs: any[] = [];
+    const createdAliases: any[] = [];
+    const infoMessages: string[] = [];
+
+    try {
+      vscode.workspace.getConfiguration = () => ({
+        get: (key: string, def: any) => (key === 'customImages' ? [...savedCustomImages] : def),
+        update: async (key: string, val: any) => {
+          if (key === 'customImages') {
+            savedCustomImages.splice(0, savedCustomImages.length, ...val);
+          }
+        }
+      });
+
+      let inputStep = 0;
+      vscode.window.showInputBox = async (opts: any) => {
+        inputStep++;
+        if (inputStep === 1) {
+          // User types 'python', which triggers built-in shadowing warning
+          return 'python';
+        }
+        if (inputStep === 2) {
+          // Box name prompt
+          return 'demo';
+        }
+        // Alias name prompt when Pin Alias... runs
+        if (opts?.prompt?.includes('alias')) {
+          return 'stable';
+        }
+        return undefined;
+      };
+
+      vscode.window.showWarningMessage = async (_msg: string, ...items: any[]) => {
+        // Choose Docker Hub option instead of BoxLite built-in
+        return items.find((i) => typeof i === 'string' && i.includes('Use Docker Hub'));
+      };
+
+      vscode.window.showQuickPick = async (items: any[]) => {
+        const startItem = items.find((i) => i.action === 'create');
+        if (startItem) {
+          return startItem;
+        }
+        // In pinImageAlias digest picker, pick the first recorded digest
+        return items.find((i) => typeof i.digest === 'string');
+      };
+
+      vscode.window.showInformationMessage = async (msg: string, ...buttons: string[]) => {
+        infoMessages.push(msg);
+        if (buttons.includes('Pin Alias...')) {
+          return 'Pin Alias...';
+        }
+        return undefined;
+      };
+      vscode.window.showErrorMessage = async (msg: string) => {
+        assert.fail(`Unexpected error message: ${msg}`);
+      };
+
+      const mockBridge: any = {
+        createBox: async (args: any) => {
+          createdBoxArgs.push(args);
+          return {
+            boxId: 'box_custom_1',
+            name: args.name,
+            status: 'running',
+            image: `docker.io/library/python@${sampleDigest}`
+          };
+        },
+        inspectBox: async () => ({
+          id: 'box_custom_1',
+          image: `docker.io/library/python@${sampleDigest}`
+        }),
+        listImages: async () => ({
+          images: [{ name: 'docker.io/library/python', sizeBytes: 12345678 }],
+          usage: { count: 1, limit: 20, knownBytes: 12345678 }
+        }),
+        inspectImage: async () => ({
+          name: 'docker.io/library/python',
+          versions: [{ digest: sampleDigest, sizeBytes: 12345678 }],
+          aliases: [],
+          history: []
+        }),
+        createImageAlias: async (args: any) => {
+          createdAliases.push(args);
+          return args;
+        }
+      };
+
+      const mockCreds: any = {
+        getApiKey: async () => 'bl_live_test_key',
+        getRestUrl: () => 'https://api.boxlite.ai'
+      };
+      const mockTreeProvider: any = { refresh: () => {} };
+      const mockImagesProvider: any = { refresh: () => {} };
+
+      registerCommands(
+        { subscriptions: [] } as any,
+        mockBridge,
+        mockCreds,
+        {} as any,
+        mockTreeProvider,
+        {} as any,
+        {} as any,
+        undefined,
+        mockImagesProvider
+      );
+
+      await runUseYourOwnImageFlow({
+        bridge: mockBridge,
+        credentials: mockCreds,
+        treeProvider: mockTreeProvider,
+        imagesProvider: mockImagesProvider
+      });
+
+      assert.strictEqual(createdBoxArgs.length, 1);
+      assert.strictEqual(createdBoxArgs[0].image, 'docker.io/library/python:latest');
+      assert.strictEqual(createdBoxArgs[0].name, 'demo');
+      assert.strictEqual(createdBoxArgs[0].entrypoint, undefined);
+      assert.ok(savedCustomImages.includes('docker.io/library/python:latest'));
+      assert.ok(infoMessages.some((m) => m.includes('docker.io/library/python@sha256:c64c687cbea9…')));
+      assert.strictEqual(createdAliases.length, 1);
+      assert.deepStrictEqual(createdAliases[0], {
+        name: 'docker.io/library/python',
+        alias: 'stable',
+        digest: sampleDigest
+      });
+    } finally {
+      vscode.workspace.getConfiguration = origGetConfiguration;
+      vscode.window.showInputBox = origShowInputBox;
+      vscode.window.showQuickPick = origShowQuickPick;
+      vscode.window.showWarningMessage = origShowWarningMessage;
+      vscode.window.showInformationMessage = origShowInformationMessage;
+      vscode.window.showErrorMessage = origShowErrorMessage;
+    }
+  });
+
+  it('surfaces Connect Private Registry action when runUseYourOwnImageFlow hits an image pull refusal', async () => {
+    const vscode = require('vscode');
+    const origGetConfiguration = vscode.workspace.getConfiguration;
+    const origShowInputBox = vscode.window.showInputBox;
+    const origShowQuickPick = vscode.window.showQuickPick;
+    const origShowErrorMessage = vscode.window.showErrorMessage;
+    const origExecuteCommand = vscode.commands.executeCommand;
+
+    const executedCmds: string[] = [];
+    const shownErrors: string[] = [];
+    const removedNames: string[] = [];
+
+    try {
+      vscode.workspace.getConfiguration = () => ({
+        get: (_k: string, def: any) => def,
+        update: async () => {}
+      });
+
+      let step = 0;
+      vscode.window.showInputBox = async () => (++step === 1 ? 'acme/api:1.4.0' : 'demo-failed');
+      vscode.window.showQuickPick = async (items: any[]) => items.find((i) => i.action === 'create');
+      vscode.window.showErrorMessage = async (msg: string, ...buttons: string[]) => {
+        shownErrors.push(msg);
+        return buttons.includes('Connect Private Registry...')
+          ? 'Connect Private Registry...'
+          : undefined;
+      };
+      vscode.commands.executeCommand = async (id: string, ...args: any[]) => {
+        executedCmds.push(id);
+        if (id !== 'boxlite.addRegistryLogin') {
+          return origExecuteCommand(id, ...args);
+        }
+      };
+
+      const mockBridge: any = {
+        createBox: async () => {
+          throw new Error(
+            "Box state transition failed: Failed to pull image 'acme/api:1.4.0': docker.io refused the pull (UNAUTHORIZED)."
+          );
+        },
+        removeBox: async (target: string) => {
+          removedNames.push(target);
+          return { boxId: 'box_orphan', removed: true };
+        }
+      };
+
+      await runUseYourOwnImageFlow({
+        bridge: mockBridge,
+        credentials: { getApiKey: async () => 'bl_live_test' } as any,
+        treeProvider: { refresh: () => {} } as any
+      });
+
+      assert.deepStrictEqual(removedNames, ['demo-failed']);
+      assert.strictEqual(shownErrors.length, 1);
+      assert.ok(shownErrors[0].includes('Leftover box "demo-failed" was automatically removed'));
+      assert.deepStrictEqual(executedCmds, ['boxlite.addRegistryLogin']);
+    } finally {
+      vscode.workspace.getConfiguration = origGetConfiguration;
+      vscode.window.showInputBox = origShowInputBox;
+      vscode.window.showQuickPick = origShowQuickPick;
+      vscode.window.showErrorMessage = origShowErrorMessage;
+      vscode.commands.executeCommand = origExecuteCommand;
+    }
+  });
+
+  it('exposes shortened digest Image child node under BoxesTreeDataProvider pointing to inspectImage', async () => {
+    const provider = new BoxesTreeDataProvider({} as any, {} as any);
+    const { BoxTreeItem } = require('../src/tree/nodes');
+    const boxItem = new BoxTreeItem({
+      id: 'box-alpine-1',
+      name: 'demo',
+      status: 'running',
+      image: `docker.io/library/alpine@${sampleDigest}`
+    });
+
+    const children = await provider.getChildren(boxItem);
+    const imageNode = children.find((c) => c.label === 'Image');
+    assert.ok(imageNode, 'Expected Image child node in BoxesTreeDataProvider');
+    assert.strictEqual(imageNode.description, 'docker.io/library/alpine@sha256:c64c687cbea9…');
+    assert.strictEqual(imageNode.command?.command, 'boxlite.inspectImage');
+    assert.deepStrictEqual(imageNode.command?.arguments, ['docker.io/library/alpine']);
   });
 });

@@ -20,8 +20,16 @@ import {
   CheckpointTreeItem,
   DomainTreeItem,
   SecretTreeItem,
-  ApiKeyTreeItem
+  ApiKeyTreeItem,
+  formatBytes
 } from '../tree/nodes';
+import {
+  handleImagePullFailureUi,
+  ImagePullFailureError,
+  launchBoxFromOwnImage,
+  LaunchBoxFromOwnImageResult,
+  runUseYourOwnImageFlow
+} from '../images/customImageWorkflow';
 import { BoxLiteDeployer } from '../deploy/deployer';
 import { scaffoldNewProject } from '../deploy/scaffold';
 import { ProjectManager, DEFAULT_CONFIG } from '../deploy/project';
@@ -32,7 +40,6 @@ import {
   validateAllowlistRule,
   validateVolumeName,
   validateGuestPath,
-  validateImageReference,
   validateAliasName,
   validateDigest,
   validateRegistryHost,
@@ -43,6 +50,10 @@ import {
   validateSecretHosts,
   validateSecretHeaders,
   validateCustomDomain,
+  formatShortImageReference,
+  getCatalogImageName,
+  imageReferencesMatch,
+  parseImageReference,
   ALLOWED_REGISTRY_HOSTS
 } from '../util/validation';
 import { formatErrorWithDiagnosis } from '../util/diagnosis';
@@ -85,7 +96,8 @@ export function registerCommands(
   secretsProvider?: SecretsTreeDataProvider,
   secretsManager?: SecretsManager,
   domainsProvider?: DomainsTreeDataProvider,
-  sshService?: SshService
+  sshService?: SshService,
+  outputChannel?: vscode.OutputChannel
 ) {
   const refreshAllViews = () => {
     bridge.restartBridge();
@@ -256,21 +268,78 @@ export function registerCommands(
   // Shared helper for box creation
   async function performCreateBox(args: CreateBoxArgs): Promise<void> {
     const boxName = args.name || 'new-box';
+    const parsedImage = args.image ? parseImageReference(args.image) : undefined;
+    let launchResult: LaunchBoxFromOwnImageResult | undefined;
+    let launchError: unknown;
+
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Creating Box ${boxName}...` },
-      async () => {
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Creating Box ${boxName}...`,
+        cancellable: Boolean(parsedImage && !parsedImage.isBuiltin)
+      },
+      async (progress, token) => {
         try {
-          const res = await bridge.createBox(args);
-          vscode.window.showInformationMessage(`Box "${boxName}" created (ID: ${res.boxId}).`);
-          treeProvider.refresh();
-          imagesProvider?.refresh();
-          secretsProvider?.refresh();
+          if (args.checkpoint || !args.image) {
+            const created = await bridge.createBox(args);
+            launchResult = {
+              box: created,
+              catalog: { recorded: false, attempts: 0 }
+            };
+          } else {
+            launchResult = await launchBoxFromOwnImage(bridge, args, {
+              onBoxCreated: () => {
+                treeProvider.refresh();
+                imagesProvider?.refresh();
+                if (parsedImage && !parsedImage.isBuiltin) {
+                  progress?.report({
+                    message: `Box started — waiting for catalog recording (~12s)...`
+                  });
+                }
+              },
+              pollOptions: {
+                isCancelled: () => Boolean(token?.isCancellationRequested),
+                onAttempt: (attempt, max) => {
+                  progress?.report({
+                    message: `Checking catalog (${attempt}/${max})...`
+                  });
+                }
+              }
+            });
+          }
         } catch (e: any) {
-          const msg = formatErrorWithDiagnosis(e);
-          vscode.window.showErrorMessage(`Failed to create Box: ${msg}`);
+          launchError = e;
         }
       }
     );
+
+    treeProvider.refresh();
+    imagesProvider?.refresh();
+    secretsProvider?.refresh();
+
+    if (launchError) {
+      if (launchError instanceof ImagePullFailureError) {
+        await handleImagePullFailureUi(launchError, { bridge, treeProvider, outputChannel });
+        return;
+      }
+      const msg = formatErrorWithDiagnosis(launchError);
+      vscode.window.showErrorMessage(`Failed to create Box: ${msg}`);
+      return;
+    }
+
+    if (launchResult) {
+      const { box, catalog } = launchResult;
+      if (catalog.recorded) {
+        const refLabel = catalog.resolvedBoxImage
+          ? ` (${formatShortImageReference(catalog.resolvedBoxImage)})`
+          : '';
+        vscode.window.showInformationMessage(
+          `Box "${boxName}" created (ID: ${box.boxId})${refLabel} and image recorded in catalog.`
+        );
+      } else {
+        vscode.window.showInformationMessage(`Box "${boxName}" created (ID: ${box.boxId}).`);
+      }
+    }
   }
 
   // 6. Create Box with Options (Interactive Configuration Wizard)
@@ -310,6 +379,12 @@ export function registerCommands(
           description: 'Restore a new independent Box from a saved checkpoint',
           detail: 'Inherits saved root disk and execution configuration (docs.boxlite.ai/cloud/checkpoints)',
           action: 'checkpoint'
+        },
+        {
+          label: '$(package) Use Your Own Image...',
+          description: 'Boot any public or private OCI image (no CLI required)',
+          detail: 'e.g. docker.io/library/alpine:3.20, docker.io/library/python:3.12-slim, ghcr.io/acme/api:1.4.0',
+          action: 'custom-image'
         }
       ];
 
@@ -386,6 +461,8 @@ export function registerCommands(
         await performCreateBox(args);
       } else if (choice.action === 'checkpoint') {
         await vscode.commands.executeCommand('boxlite.createBoxFromCheckpoint');
+      } else if (choice.action === 'custom-image') {
+        await vscode.commands.executeCommand('boxlite.addImage');
       }
     })
   );
@@ -965,10 +1042,12 @@ export function registerCommands(
       if (!imageName) {
         return;
       }
+      const parsed = parseImageReference(imageName);
       const args = await showBoxConfigurationWizard(
         {
           image: imageName,
-          name: generateBoxName()
+          name: generateBoxName(),
+          entrypointPreset: parsed.isBuiltin ? 'supervisor' : 'default'
         },
         secretsManager
       );
@@ -1010,14 +1089,17 @@ export function registerCommands(
         return;
       }
 
+      const parsed = parseImageReference(imageName);
+      const catalogTarget = parsed.isBuiltin ? imageName : parsed.canonicalName || imageName;
+
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Inspecting image ${imageName}...`
+          title: `Inspecting image ${catalogTarget}...`
         },
         async () => {
           try {
-            const inspected = await bridge.inspectImage(imageName);
+            const inspected = await bridge.inspectImage(catalogTarget);
             const doc = await vscode.workspace.openTextDocument({
               content: JSON.stringify(inspected, null, 2),
               language: 'json'
@@ -1032,56 +1114,110 @@ export function registerCommands(
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('boxlite.pinImageAlias', async (item?: any) => {
-      const imageName = await resolveImageName(item, bridge);
-      if (!imageName) {
-        return;
-      }
-
-      const alias = await vscode.window.showInputBox({
-        prompt: `Enter alias tag for image "${imageName}" (e.g. "stable", "v1.0", "prod")`,
-        placeHolder: 'e.g. stable',
-        validateInput: (v) => {
-          const check = validateAliasName(v);
-          return check.valid ? null : check.error || 'Invalid alias';
+    vscode.commands.registerCommand(
+      'boxlite.pinImageAlias',
+      async (item?: any, preselectedDigest?: string) => {
+        const imageName = await resolveImageName(item, bridge);
+        if (!imageName) {
+          return;
         }
-      });
-      if (!alias) {
-        return;
-      }
 
-      const digest = await vscode.window.showInputBox({
-        prompt: `Enter exact build digest for "${alias}" (e.g. sha256:c64c687c...)`,
-        placeHolder: 'sha256:...',
-        validateInput: (v) => {
-          const check = validateDigest(v);
-          return check.valid ? null : check.error || 'Invalid digest';
+        const parsed = parseImageReference(imageName);
+        const catalogTarget = parsed.isBuiltin ? imageName : parsed.canonicalName || imageName;
+
+        const alias = await vscode.window.showInputBox({
+          prompt: `Enter alias tag for image "${catalogTarget}" (e.g. "stable", "v1.0", "prod")`,
+          placeHolder: 'e.g. stable',
+          validateInput: (v) => {
+            const check = validateAliasName(v);
+            return check.valid ? null : check.error || 'Invalid alias';
+          }
+        });
+        if (!alias) {
+          return;
         }
-      });
-      if (!digest) {
-        return;
-      }
 
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: `Pinning alias "${alias}" on ${imageName}...`
-        },
-        async () => {
+        let digest = preselectedDigest?.trim();
+        if (!digest && typeof bridge.inspectImage === 'function') {
           try {
-            await bridge.createImageAlias({
-              name: imageName,
-              alias: alias.trim(),
-              digest: digest.trim()
-            });
-            vscode.window.showInformationMessage(`Alias "${alias}" pinned to ${imageName}@${digest.substring(0, 19)}...`);
-            imagesProvider?.refresh();
-          } catch (e: any) {
-            vscode.window.showErrorMessage(`Failed to pin image alias: ${e.message}`);
+            const detail = await bridge.inspectImage(catalogTarget);
+            const versions = Array.isArray(detail?.versions) ? detail.versions : [];
+            const validVersions = versions.filter((v) => typeof v?.digest === 'string' && v.digest.trim());
+            if (validVersions.length > 0) {
+              const picks: Array<vscode.QuickPickItem & { digest?: string }> = [
+                ...validVersions.map((v, idx) => ({
+                  label: v.digest,
+                  description: [
+                    idx === 0 ? 'latest recorded' : undefined,
+                    v.sizeBytes ? formatBytes(v.sizeBytes) : undefined,
+                    v.lastUsedAt ? `last used ${v.lastUsedAt}` : undefined
+                  ]
+                    .filter(Boolean)
+                    .join(' · '),
+                  digest: v.digest
+                })),
+                {
+                  label: '$(edit) Enter digest manually...',
+                  description: 'Paste an exact sha256:... build digest'
+                }
+              ];
+              const pickedDigest = await vscode.window.showQuickPick(picks, {
+                title: `Select recorded build digest for "${catalogTarget}"`,
+                placeHolder: `Choose build to pin alias "${alias.trim()}" to`
+              });
+              if (!pickedDigest) {
+                return;
+              }
+              digest = pickedDigest.digest;
+            }
+          } catch {
+            // Fall back to manual digest prompt if catalog inspect is unavailable
           }
         }
-      );
-    })
+
+        if (!digest) {
+          digest = await vscode.window.showInputBox({
+            prompt: `Enter exact build digest for "${alias}" (e.g. sha256:c64c687c...)`,
+            placeHolder: 'sha256:...',
+            validateInput: (v) => {
+              const check = validateDigest(v);
+              return check.valid ? null : check.error || 'Invalid digest';
+            }
+          });
+        }
+        if (!digest) {
+          return;
+        }
+
+        const digestCheck = validateDigest(digest);
+        if (!digestCheck.valid) {
+          vscode.window.showErrorMessage(digestCheck.error || 'Invalid digest.');
+          return;
+        }
+
+        await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: `Pinning alias "${alias}" on ${catalogTarget}...`
+          },
+          async () => {
+            try {
+              await bridge.createImageAlias({
+                name: catalogTarget,
+                alias: alias.trim(),
+                digest: digest!.trim()
+              });
+              vscode.window.showInformationMessage(
+                `Alias "${alias}" pinned to ${catalogTarget}@${digest!.substring(0, 19)}...`
+              );
+              imagesProvider?.refresh();
+            } catch (e: any) {
+              vscode.window.showErrorMessage(`Failed to pin image alias: ${e.message}`);
+            }
+          }
+        );
+      }
+    )
   );
 
   context.subscriptions.push(
@@ -1099,8 +1235,10 @@ export function registerCommands(
         return;
       }
 
+      const catalogTarget = getCatalogImageName(imageName) || imageName;
+
       const confirm = await vscode.window.showWarningMessage(
-        `Are you sure you want to remove image "${imageName}" from your organization catalog?\nRemoving an image takes its versions, aliases, and history with it. Images used by active boxes cannot be removed (docs.boxlite.ai/cloud/image-catalog).`,
+        `Are you sure you want to remove image "${catalogTarget}" from your organization catalog?\nRemoving an image takes its versions, aliases, and history with it. Images used by active boxes cannot be removed (docs.boxlite.ai/cloud/image-catalog).`,
         { modal: true },
         'Delete Image'
       );
@@ -1112,22 +1250,26 @@ export function registerCommands(
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: `Removing image ${imageName}...`
+          title: `Removing image ${catalogTarget}...`
         },
         async () => {
           try {
-            await bridge.removeImage(imageName);
+            await bridge.removeImage(catalogTarget);
 
             // Also clean up from customImages setting if saved there
             const config = vscode.workspace.getConfiguration('boxlite');
             const custom = config.get<string[]>('customImages', []);
-            if (custom.includes(imageName)) {
-              const updated = custom.filter((x) => x !== imageName);
+            const updated = custom.filter(
+              (x) =>
+                x.toLowerCase() !== imageName.toLowerCase() &&
+                !imageReferencesMatch(x, catalogTarget)
+            );
+            if (updated.length !== custom.length) {
               await config.update('customImages', updated, vscode.ConfigurationTarget.Global);
             }
 
             imagesProvider?.refresh();
-            vscode.window.showInformationMessage(`Image "${imageName}" removed successfully.`);
+            vscode.window.showInformationMessage(`Image "${catalogTarget}" removed successfully.`);
           } catch (e: any) {
             vscode.window.showErrorMessage(`Failed to remove image: ${e.message}`);
           }
@@ -1137,91 +1279,18 @@ export function registerCommands(
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('boxlite.addImage', async () => {
-      const input = await vscode.window.showInputBox({
-        prompt: 'Enter container image reference from public or private registry',
-        placeHolder: 'e.g. docker.io/library/alpine:3.20 or ghcr.io/acme/app:1.4.0',
-        validateInput: (v) => {
-          const check = validateImageReference(v);
-          return check.valid ? null : check.error || 'Invalid image reference';
-        }
-      });
-
-      if (!input || !input.trim()) {
-        return;
-      }
-
-      const imageRef = input.trim();
-      const refCheck = validateImageReference(imageRef);
-      if (refCheck.warning) {
-        vscode.window.showWarningMessage(refCheck.warning);
-      }
-
-      const action = await vscode.window.showQuickPick(
-        [
-          {
-            label: '$(play) Create a Box now with this image',
-            description: 'Boots microVM and automatically records image into catalog (~12s)',
-            action: 'create'
-          },
-          {
-            label: '$(save) Save to custom image list',
-            description: 'Keep in sidebar for later creation without starting a box now',
-            action: 'save'
-          }
-        ],
-        { title: `Use Image: ${imageRef}` }
-      );
-
-      if (!action) {
-        return;
-      }
-
-      // Always save to custom images list in settings so user doesn't lose it
-      const config = vscode.workspace.getConfiguration('boxlite');
-      const current = config.get<string[]>('customImages', []);
-      if (!current.includes(imageRef)) {
-        const updated = [...current, imageRef];
-        await config.update('customImages', updated, vscode.ConfigurationTarget.Global);
-      }
-
-      if (action.action === 'save') {
-        vscode.window.showInformationMessage(`Image "${imageRef}" saved to your custom images list.`);
-        imagesProvider?.refresh();
-        return;
-      }
-
-      // Action: create
-      const args = await showBoxConfigurationWizard(
+    vscode.commands.registerCommand('boxlite.addImage', async (initialImageRef?: string) => {
+      await runUseYourOwnImageFlow(
         {
-          image: imageRef,
-          name: generateBoxName()
+          bridge,
+          credentials,
+          treeProvider,
+          imagesProvider,
+          secretsManager,
+          outputChannel
         },
-        secretsManager
+        typeof initialImageRef === 'string' ? initialImageRef : undefined
       );
-
-      if (args) {
-        await performCreateBox(args);
-        imagesProvider?.refresh();
-
-        // Bounded polling for catalog recording (~12s lag as documented in agent.md & docs.boxlite.ai/cloud/image-catalog)
-        let pollAttempts = 0;
-        const pollInterval = setInterval(async () => {
-          pollAttempts++;
-          try {
-            const res = await bridge.listImages();
-            const found = (res.images || []).some(
-              (img) => typeof img?.name === 'string' && img.name.toLowerCase() === imageRef.toLowerCase()
-            );
-            if (found || pollAttempts >= 8) {
-              clearInterval(pollInterval);
-              imagesProvider?.refresh();
-            }
-          } catch {
-            clearInterval(pollInterval);
-          }
-        }, 3000);
-      }
     })
   );
 

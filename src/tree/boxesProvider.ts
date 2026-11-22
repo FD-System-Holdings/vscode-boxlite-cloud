@@ -4,6 +4,7 @@ import { CredentialsManager } from '../auth/credentials';
 import { LogStreamManager } from '../logs/logStream';
 import { SshStore } from '../ssh/sshStore';
 import { BoxLiteTreeItem, BoxTreeItem, BoxChildTreeItem } from './nodes';
+import { formatShortImageReference, getCatalogImageName } from '../util/validation';
 
 export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem>, vscode.Disposable {
   private _onDidChangeTreeData = new vscode.EventEmitter<BoxLiteTreeItem | undefined | null | void>();
@@ -172,7 +173,28 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
         );
       }
 
-      // 2. Tunnels / URLs
+      // 2. Image readback (digest-pinned when booted from custom OCI image)
+      if (element.box.image) {
+        const shortRef = formatShortImageReference(element.box.image);
+        const catalogTarget = getCatalogImageName(element.box.image) || element.box.image;
+        children.push(
+          new BoxChildTreeItem(
+            'Image',
+            shortRef,
+            'package',
+            {
+              command: 'boxlite.inspectImage',
+              title: 'Inspect Image (JSON)',
+              arguments: [catalogTarget]
+            },
+            vscode.TreeItemCollapsibleState.None,
+            'box-image-item',
+            element.box.id
+          )
+        );
+      }
+
+      // 3. Tunnels / URLs
       if (element.tunnels && element.tunnels.length > 0) {
         for (const t of element.tunnels) {
           const typeLabel = t.isPublic ? 'Public URL' : 'Private URL';

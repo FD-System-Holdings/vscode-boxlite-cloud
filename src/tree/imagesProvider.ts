@@ -10,6 +10,11 @@ import {
   ImageChildTreeItem,
   formatBytes
 } from './nodes';
+import {
+  extractImageDigest,
+  formatShortImageReference,
+  getCatalogImageName
+} from '../util/validation';
 
 export const BUILTIN_IMAGES = ['base', 'python', 'node', 'sandbaseai-hermes'];
 
@@ -61,28 +66,58 @@ export function buildImageList(
   const safeCustomImageNames = Array.isArray(customImageNames) ? customImageNames : [];
   const safeActiveBoxes = Array.isArray(activeBoxes) ? activeBoxes : [];
 
-  // Map active box usage by image reference
-  const boxesByImage = new Map<string, { id: string; name: string; status: string }[]>();
+  // Map active box usage by both exact reference and canonical catalog name (e.g. digest readbacks)
+  const boxesByExact = new Map<string, { id: string; name: string; status: string; rawImage: string; digest?: string }[]>();
+  const boxesByCanonical = new Map<string, { id: string; name: string; status: string; rawImage: string; digest?: string }[]>();
   for (const b of safeActiveBoxes) {
     if (!b) {
       continue;
     }
     const rawImg = typeof b.image === 'string' && b.image.trim() ? b.image.trim() : 'python';
-    const key = rawImg.toLowerCase();
-    const existing = boxesByImage.get(key) || [];
+    const exactKey = rawImg.toLowerCase();
+    const canonicalKey = getCatalogImageName(rawImg).toLowerCase();
     const boxId = typeof b.id === 'string' ? b.id : String(b.id || '');
-    existing.push({
+    const entry = {
       id: boxId,
       name: typeof b.name === 'string' && b.name ? b.name : `box-${boxId.substring(0, 8)}`,
-      status: String(b.status || 'unknown').toLowerCase().trim()
-    });
-    boxesByImage.set(key, existing);
+      status: String(b.status || 'unknown').toLowerCase().trim(),
+      rawImage: rawImg,
+      digest: extractImageDigest(rawImg)
+    };
+    const exactList = boxesByExact.get(exactKey) || [];
+    exactList.push(entry);
+    boxesByExact.set(exactKey, exactList);
+
+    if (canonicalKey) {
+      const canonList = boxesByCanonical.get(canonicalKey) || [];
+      canonList.push(entry);
+      boxesByCanonical.set(canonicalKey, canonList);
+    }
   }
+
+  const mergeBoxRefs = (
+    exactList: { id: string; name: string; status: string }[] = [],
+    canonMatches: { id: string; name: string; status: string }[] = []
+  ): { id: string; name: string; status: string }[] => {
+    const merged: { id: string; name: string; status: string }[] = [];
+    const seenIds = new Set<string>();
+    for (const item of [...exactList, ...canonMatches]) {
+      const dedupeKey = item.id || item.name;
+      if (dedupeKey && seenIds.has(dedupeKey)) {
+        continue;
+      }
+      if (dedupeKey) {
+        seenIds.add(dedupeKey);
+      }
+      merged.push({ id: item.id, name: item.name, status: item.status });
+    }
+    return merged;
+  };
 
   // 1. Built-in images (free · not counted)
   const builtins: ImageItem[] = safeBuiltinNames.map((name) => {
     const key = name.toLowerCase().trim();
-    const boxes = boxesByImage.get(key) || [];
+    const boxes = mergeBoxRefs(boxesByExact.get(key) || []);
     return {
       name,
       builtin: true,
@@ -98,6 +133,7 @@ export function buildImageList(
   // 2. Catalog images (excluding built-in names)
   const catalog: ImageItem[] = [];
   const seenCatalogKeys = new Set<string>();
+  const seenCatalogCanonicalKeys = new Set<string>();
 
   for (const cat of safeCatalogImages) {
     const catName = extractImageName(cat);
@@ -105,35 +141,57 @@ export function buildImageList(
       continue;
     }
     const key = catName.toLowerCase();
+    const canonicalKey = getCatalogImageName(catName).toLowerCase();
     if (builtinKeys.has(key)) {
       continue;
     }
     seenCatalogKeys.add(key);
-    const boxes = boxesByImage.get(key) || [];
+    if (canonicalKey) {
+      seenCatalogCanonicalKeys.add(canonicalKey);
+    }
+    const exactBoxes = boxesByExact.get(key) || [];
+    const canonicalCandidates = (boxesByCanonical.get(canonicalKey) || []).filter(
+      (b) => Boolean(b.digest) || key === canonicalKey
+    );
+    const boxes = mergeBoxRefs(exactBoxes, canonicalCandidates);
     const rawCat = cat as any;
     const catBoxCount = cat.boxCount ?? rawCat.box_count ?? 0;
+    const resolvedDigest =
+      cat.digest ??
+      rawCat.digest ??
+      extractImageDigest(catName) ??
+      canonicalCandidates.find((b) => b.digest)?.digest;
     catalog.push({
       ...(typeof cat === 'object' && cat !== null ? cat : {}),
       name: catName,
+      digest: resolvedDigest,
       sizeBytes: cat.sizeBytes ?? rawCat.size_bytes,
       lastUsedAt: cat.lastUsedAt ?? rawCat.last_used_at ?? rawCat.createdAt ?? rawCat.created_at,
       builtin: false,
       recorded: true,
-      isDefault: key === normDefault,
+      isDefault: key === normDefault || canonicalKey === getCatalogImageName(normDefault).toLowerCase(),
       boxCount: Math.max(catBoxCount, boxes.length),
       boxes: boxes.length > 0 ? boxes : cat.boxes
     });
   }
 
   // Also include in-use images from activeBoxes not yet in catalog or builtins
-  for (const [key, boxes] of boxesByImage.entries()) {
-    if (!builtinKeys.has(key) && !seenCatalogKeys.has(key)) {
+  for (const [key, rawBoxes] of boxesByExact.entries()) {
+    const canonicalKey = getCatalogImageName(key).toLowerCase();
+    if (
+      !builtinKeys.has(key) &&
+      !seenCatalogKeys.has(key) &&
+      (!canonicalKey || !seenCatalogCanonicalKeys.has(canonicalKey))
+    ) {
       seenCatalogKeys.add(key);
-      const originalName = boxes[0]?.id
-        ? (safeActiveBoxes.find((b) => b && (typeof b.image === 'string' ? b.image : '').toLowerCase().trim() === key)?.image || key)
-        : key;
+      if (canonicalKey) {
+        seenCatalogCanonicalKeys.add(canonicalKey);
+      }
+      const boxes = mergeBoxRefs(rawBoxes);
+      const originalName = rawBoxes[0]?.rawImage || key;
       catalog.push({
         name: originalName,
+        digest: rawBoxes[0]?.digest,
         builtin: false,
         recorded: true,
         isDefault: key === normDefault,
@@ -151,13 +209,19 @@ export function buildImageList(
       continue;
     }
     const key = resolvedCustom.toLowerCase();
-    if (builtinKeys.has(key) || seenCatalogKeys.has(key)) {
+    const canonicalKey = getCatalogImageName(resolvedCustom).toLowerCase();
+    if (
+      builtinKeys.has(key) ||
+      seenCatalogKeys.has(key) ||
+      (canonicalKey && seenCatalogCanonicalKeys.has(canonicalKey))
+    ) {
       continue;
     }
     seenCatalogKeys.add(key);
-    const boxes = boxesByImage.get(key) || [];
+    const boxes = mergeBoxRefs(boxesByExact.get(key) || []);
     customOnly.push({
       name: resolvedCustom,
+      digest: extractImageDigest(resolvedCustom),
       builtin: false,
       recorded: false,
       isDefault: key === normDefault,
@@ -414,8 +478,22 @@ export class ImagesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTr
         );
       }
 
-      // 2. Metadata: Last used / Size (if catalog)
+      // 2. Metadata: Digest / Last used / Size (if catalog)
       if (!img.builtin && img.recorded) {
+        if (img.digest) {
+          children.push(
+            new ImageChildTreeItem(
+              'Pinned Digest',
+              formatShortImageReference(`@${img.digest}`).replace(/^@/, ''),
+              'verified',
+              undefined,
+              vscode.TreeItemCollapsibleState.None,
+              'image-digest',
+              img.name,
+              img.digest
+            )
+          );
+        }
         if (img.lastUsedAt) {
           children.push(
             new ImageChildTreeItem(

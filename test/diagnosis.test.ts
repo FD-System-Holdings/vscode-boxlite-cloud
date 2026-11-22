@@ -1,5 +1,9 @@
 import * as assert from 'assert';
-import { diagnoseError } from '../src/util/diagnosis';
+import {
+  diagnoseError,
+  isImagePullError,
+  isImageCatalogLimitError
+} from '../src/util/diagnosis';
 
 describe('Error Diagnostics (§5 Table Mapping)', () => {
   it('should diagnose 502 box unreachable errors', () => {
@@ -70,5 +74,26 @@ describe('Error Diagnostics (§5 Table Mapping)', () => {
       diag.checklist.some((item) => item.includes('Secret.hosts')),
       true
     );
+  });
+
+  it('should diagnose image pull UNAUTHORIZED failures without misattributing to BOXLITE_API_KEY 401', () => {
+    const msg =
+      "Box state transition failed: Failed to pull image 'acme/api:1.4.0': docker.io refused the pull (UNAUTHORIZED). The image is private or does not exist, and no registry login of the organization covers it.";
+    assert.strictEqual(isImagePullError(msg), true);
+
+    const diag = diagnoseError(msg);
+    assert.strictEqual(diag.summary, 'Image Pull Failed');
+    assert.strictEqual(diag.checklist.some((item) => item.includes('BOXLITE_API_KEY')), false);
+    assert.ok(diag.checklist[0].includes('typos'));
+    assert.ok(diag.checklist[1].includes('Connect Private Registry'));
+    assert.ok(diag.checklist[2].includes('tag'));
+    assert.ok(diag.checklist[3].includes('box name passed to create()'));
+  });
+
+  it('should diagnose image catalog 20-image limit errors', () => {
+    const msg = 'Organization image catalog limit reached (20 images maximum)';
+    assert.strictEqual(isImageCatalogLimitError(msg), true);
+    const diag = diagnoseError(msg);
+    assert.strictEqual(diag.summary, 'Image Catalog Limit Reached (20 images)');
   });
 });

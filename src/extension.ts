@@ -305,7 +305,8 @@ export async function activate(context: vscode.ExtensionContext) {
     secretsProvider,
     secretsManager,
     domainsProvider,
-    sshService
+    sshService,
+    outputChannel
   );
 
   // Configuration change listener

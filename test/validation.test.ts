@@ -5,6 +5,11 @@ import {
   validateVolumeName,
   validateGuestPath,
   validateImageReference,
+  parseImageReference,
+  getCatalogImageName,
+  extractImageDigest,
+  imageReferencesMatch,
+  formatShortImageReference,
   validateAliasName,
   validateDigest,
   validateRegistryHost,
@@ -306,5 +311,53 @@ describe('Image Reference, Alias and Registry Validation', () => {
     );
     assert.strictEqual(leaked.valid, false);
     assert.ok(leaked.error?.includes('<BOXLITE_SECRET:openai>'));
+  });
+
+  it('normalizes OCI image references and built-ins consistently with BoxLite catalog semantics', () => {
+    const alpineShort = parseImageReference('alpine');
+    assert.strictEqual(alpineShort.isBuiltin, false);
+    assert.strictEqual(alpineShort.registry, 'docker.io');
+    assert.strictEqual(alpineShort.repository, 'library/alpine');
+    assert.strictEqual(alpineShort.canonicalName, 'docker.io/library/alpine');
+    assert.strictEqual(alpineShort.resolvedRef, 'docker.io/library/alpine:latest');
+
+    const hubOrg = parseImageReference('acme/api:1.4.0');
+    assert.strictEqual(hubOrg.canonicalName, 'docker.io/acme/api');
+    assert.strictEqual(hubOrg.resolvedRef, 'docker.io/acme/api:1.4.0');
+
+    const explicitHub = parseImageReference('docker.io/library/alpine:3.20');
+    assert.strictEqual(explicitHub.canonicalName, 'docker.io/library/alpine');
+    assert.strictEqual(explicitHub.resolvedRef, 'docker.io/library/alpine:3.20');
+
+    const digestSha = 'sha256:c64c687cbea90123456789abcdef0123456789abcdef0123456789abcdef0123';
+    const digestRef = parseImageReference(`docker.io/library/alpine@${digestSha}`);
+    assert.strictEqual(digestRef.canonicalName, 'docker.io/library/alpine');
+    assert.strictEqual(digestRef.digest, digestSha);
+    assert.strictEqual(extractImageDigest(`docker.io/library/alpine@${digestSha}`), digestSha);
+    assert.strictEqual(
+      formatShortImageReference(`docker.io/library/alpine@${digestSha}`),
+      'docker.io/library/alpine@sha256:c64c687cbea9…'
+    );
+
+    const portRegistry = parseImageReference('localhost:5000/org/app:v1');
+    assert.strictEqual(portRegistry.registry, 'localhost:5000');
+    assert.strictEqual(portRegistry.repository, 'org/app');
+    assert.strictEqual(portRegistry.canonicalName, 'localhost:5000/org/app');
+
+    const indexDocker = parseImageReference('index.docker.io/library/python:3.12-slim');
+    assert.strictEqual(indexDocker.canonicalName, 'docker.io/library/python');
+    assert.strictEqual(indexDocker.resolvedRef, 'docker.io/library/python:3.12-slim');
+
+    const builtinPy = parseImageReference('python');
+    assert.strictEqual(builtinPy.isBuiltin, true);
+    assert.strictEqual(builtinPy.canonicalName, 'python');
+
+    const hubPy = parseImageReference('python:3.12-slim');
+    assert.strictEqual(hubPy.isBuiltin, false);
+    assert.strictEqual(hubPy.canonicalName, 'docker.io/library/python');
+
+    assert.strictEqual(getCatalogImageName('docker.io/library/alpine:3.20'), 'docker.io/library/alpine');
+    assert.strictEqual(imageReferencesMatch('alpine', `docker.io/library/alpine@${digestSha}`), true);
+    assert.strictEqual(imageReferencesMatch('python', 'docker.io/library/python:3.12-slim'), false);
   });
 });

@@ -140,7 +140,138 @@ export function validateGuestPath(guestPath: string): { valid: boolean; error?: 
   return { valid: true };
 }
 
-export function validateImageReference(imageRef: string): { valid: boolean; error?: string; warning?: string } {
+export const BUILTIN_IMAGE_NAMES = ['base', 'python', 'node', 'sandbaseai-hermes'] as const;
+
+export interface ParsedImageReference {
+  raw: string;
+  isBuiltin: boolean;
+  registry: string;
+  repository: string;
+  canonicalName: string;
+  resolvedRef: string;
+  tag?: string;
+  digest?: string;
+}
+
+export function parseImageReference(imageRef: string): ParsedImageReference {
+  const raw = (imageRef || '').trim();
+  if (!raw) {
+    return {
+      raw: '',
+      isBuiltin: false,
+      registry: '',
+      repository: '',
+      canonicalName: '',
+      resolvedRef: ''
+    };
+  }
+
+  const lowerRaw = raw.toLowerCase();
+  if (!raw.includes('/') && !raw.includes(':') && !raw.includes('@') && (BUILTIN_IMAGE_NAMES as readonly string[]).includes(lowerRaw)) {
+    return {
+      raw,
+      isBuiltin: true,
+      registry: '',
+      repository: lowerRaw,
+      canonicalName: lowerRaw,
+      resolvedRef: lowerRaw
+    };
+  }
+
+  let nameAndTag = raw;
+  let digest: string | undefined;
+  const atIdx = raw.indexOf('@');
+  if (atIdx !== -1) {
+    digest = raw.slice(atIdx + 1).trim() || undefined;
+    nameAndTag = raw.slice(0, atIdx);
+  }
+
+  let tag: string | undefined;
+  let namePart = nameAndTag;
+  const lastSlash = nameAndTag.lastIndexOf('/');
+  const colonIdx = nameAndTag.indexOf(':', lastSlash + 1);
+  if (colonIdx !== -1) {
+    tag = nameAndTag.slice(colonIdx + 1).trim() || undefined;
+    namePart = nameAndTag.slice(0, colonIdx);
+  }
+
+  const segments = namePart.split('/').filter((s) => s.length > 0);
+  let registry = 'docker.io';
+  let repository = '';
+
+  if (segments.length === 1) {
+    registry = 'docker.io';
+    repository = `library/${segments[0].toLowerCase()}`;
+  } else if (segments.length > 1) {
+    const first = segments[0];
+    if (first.includes('.') || first.includes(':') || first.toLowerCase() === 'localhost') {
+      const normFirst = first.toLowerCase();
+      registry =
+        normFirst === 'index.docker.io' || normFirst === 'registry-1.docker.io'
+          ? 'docker.io'
+          : normFirst;
+      const rest = segments.slice(1).map((s) => s.toLowerCase());
+      repository = registry === 'docker.io' && rest.length === 1 ? `library/${rest[0]}` : rest.join('/');
+    } else {
+      registry = 'docker.io';
+      repository = segments.map((s) => s.toLowerCase()).join('/');
+    }
+  }
+
+  const canonicalName = repository ? `${registry}/${repository}` : '';
+  const effectiveTag = !tag && !digest ? 'latest' : tag;
+  const resolvedRef = canonicalName
+    ? `${canonicalName}${effectiveTag ? `:${effectiveTag}` : ''}${digest ? `@${digest}` : ''}`
+    : raw;
+
+  return {
+    raw,
+    isBuiltin: false,
+    registry,
+    repository,
+    canonicalName,
+    resolvedRef,
+    tag: effectiveTag,
+    digest
+  };
+}
+
+export function getCatalogImageName(imageRef: string): string {
+  return parseImageReference(imageRef).canonicalName;
+}
+
+export function extractImageDigest(imageRef?: string): string | undefined {
+  if (!imageRef || typeof imageRef !== 'string') {
+    return undefined;
+  }
+  const match = /@(sha256:[a-fA-F0-9]{64})\b/.exec(imageRef.trim());
+  return match ? match[1].toLowerCase() : undefined;
+}
+
+export function imageReferencesMatch(a: string, b: string): boolean {
+  const normA = getCatalogImageName(a);
+  const normB = getCatalogImageName(b);
+  if (!normA || !normB) {
+    return false;
+  }
+  return normA.toLowerCase() === normB.toLowerCase();
+}
+
+export function formatShortImageReference(imageRef: string): string {
+  const trimmed = (imageRef || '').trim();
+  if (!trimmed) {
+    return '';
+  }
+  return trimmed.replace(/@(sha256:[a-fA-F0-9]{12})[a-fA-F0-9]{52}/g, '@$1…');
+}
+
+export function validateImageReference(imageRef: string): {
+  valid: boolean;
+  error?: string;
+  warning?: string;
+  resolvedReference?: string;
+  canonicalName?: string;
+} {
   const trimmed = imageRef.trim();
   if (!trimmed) {
     return { valid: false, error: 'Image reference cannot be empty.' };
@@ -154,11 +285,13 @@ export function validateImageReference(imageRef: string): { valid: boolean; erro
     return { valid: false, error: 'Image reference must not include URL scheme (http:// or https://).' };
   }
 
-  const bareBuiltins = ['base', 'python', 'node', 'sandbaseai-hermes'];
-  if (bareBuiltins.includes(trimmed.toLowerCase())) {
+  const parsed = parseImageReference(trimmed);
+  if (parsed.isBuiltin) {
     return {
       valid: true,
-      warning: `Notice: '${trimmed}' refers to BoxLite's built-in image, not Docker Hub's. To use an image from Docker Hub, specify the full reference (e.g. 'docker.io/library/${trimmed}:latest') (agent.md & docs.boxlite.ai/cloud/images).`
+      warning: `Notice: '${trimmed}' refers to BoxLite's built-in image, not Docker Hub's. To use an image from Docker Hub, specify the full reference (e.g. 'docker.io/library/${trimmed}:latest') (agent.md & docs.boxlite.ai/cloud/images).`,
+      resolvedReference: parsed.resolvedRef,
+      canonicalName: parsed.canonicalName
     };
   }
 
@@ -171,7 +304,11 @@ export function validateImageReference(imageRef: string): { valid: boolean; erro
     };
   }
 
-  return { valid: true };
+  return {
+    valid: true,
+    resolvedReference: parsed.resolvedRef,
+    canonicalName: parsed.canonicalName
+  };
 }
 
 export function validateAliasName(alias: string): { valid: boolean; error?: string } {

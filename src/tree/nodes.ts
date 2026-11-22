@@ -279,6 +279,9 @@ export class ImageTreeItem extends BoxLiteTreeItem {
     if (boxCount > 0) {
       tooltip += `\nIn use by: ${boxCount} active box(es)`;
     }
+    if (image.digest) {
+      tooltip += `\nDigest: ${image.digest}`;
+    }
     if (image.lastUsedAt) {
       tooltip += `\nLast used: ${image.lastUsedAt}`;
     }

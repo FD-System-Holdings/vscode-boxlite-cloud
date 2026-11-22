@@ -24,6 +24,9 @@ if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8")
 
 
+_UNSET = object()
+
+
 def log_debug(msg: str):
     sys.stderr.write(f"[boxlite-bridge] {msg}\n")
     sys.stderr.flush()
@@ -54,6 +57,69 @@ def extract_box_status(info: Any) -> str:
     if "." in raw_str:
         raw_str = raw_str.split(".")[-1]
     return raw_str.strip() or "unknown"
+
+
+_BUILTIN_IMAGES = ("base", "python", "node", "sandbaseai-hermes")
+
+
+def _canonical_catalog_image_name(image_ref: str) -> str:
+    raw = (image_ref or "").strip()
+    if not raw:
+        return ""
+    lower_raw = raw.lower()
+    if "/" not in raw and ":" not in raw and "@" not in raw and lower_raw in _BUILTIN_IMAGES:
+        return lower_raw
+
+    name_and_tag = raw.split("@", 1)[0]
+    last_slash = name_and_tag.rfind("/")
+    colon_idx = name_and_tag.find(":", last_slash + 1)
+    name_part = name_and_tag[:colon_idx] if colon_idx != -1 else name_and_tag
+
+    segments = [s for s in name_part.split("/") if s]
+    if not segments:
+        return ""
+    if len(segments) == 1:
+        return f"docker.io/library/{segments[0].lower()}"
+
+    first = segments[0]
+    if "." in first or ":" in first or first.lower() == "localhost":
+        norm_first = first.lower()
+        registry = "docker.io" if norm_first in ("index.docker.io", "registry-1.docker.io") else norm_first
+        rest = [s.lower() for s in segments[1:]]
+        if registry == "docker.io" and len(rest) == 1:
+            repository = f"library/{rest[0]}"
+        else:
+            repository = "/".join(rest)
+    else:
+        registry = "docker.io"
+        repository = "/".join(s.lower() for s in segments)
+
+    return f"{registry}/{repository}" if repository else ""
+
+
+def _is_not_found_error(err: Exception) -> bool:
+    lower = str(err).lower()
+    return "404" in lower or "not found" in lower
+
+
+def _is_image_pull_error(message: str) -> bool:
+    lower = (message or "").lower()
+    return (
+        "failed to pull image" in lower
+        or "refused the pull" in lower
+        or "no registry login" in lower
+        or "manifest unknown" in lower
+        or "pull access denied" in lower
+        or "repository does not exist" in lower
+        or ("box state transition failed" in lower and ("pull" in lower or "image" in lower))
+    )
+
+
+def _is_image_catalog_limit_error(message: str) -> bool:
+    lower = (message or "").lower()
+    return ("image" in lower or "catalog" in lower) and (
+        "limit" in lower or "quota" in lower or "20 images" in lower or "maximum" in lower
+    )
 
 
 class TunnelResultFallback:
@@ -137,7 +203,7 @@ class RestRuntimeFallback:
         self.rest_url = rest_url.rstrip("/")
         self.api_key = api_key
 
-    def _request(self, method: str, path: str, body: Any = None) -> Any:
+    def _request(self, method: str, path: str, body: Any = None, timeout: int = 30) -> Any:
         url = f"{self.rest_url}/v1{path}"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -148,7 +214,7 @@ class RestRuntimeFallback:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 content = resp.read().decode("utf-8")
                 if content:
                     return json.loads(content)
@@ -178,31 +244,36 @@ class RestRuntimeFallback:
 
     async def inspect(self, box_id: str) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._request, "GET", f"/boxes/{box_id}")
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
+        return await loop.run_in_executor(None, self._request, "GET", f"/boxes/{encoded_id}")
 
     async def create(self, **kwargs) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._request, "POST", "/boxes", kwargs)
+        return await loop.run_in_executor(None, lambda: self._request("POST", "/boxes", kwargs, timeout=120))
 
     async def start(self, box_id: str) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._request, "POST", f"/boxes/{box_id}/start")
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
+        return await loop.run_in_executor(None, lambda: self._request("POST", f"/boxes/{encoded_id}/start", timeout=120))
 
     async def stop(self, box_id: str) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._request, "POST", f"/boxes/{box_id}/stop")
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
+        return await loop.run_in_executor(None, self._request, "POST", f"/boxes/{encoded_id}/stop")
 
     async def remove(self, box_id: str, force: bool = False) -> None:
         loop = asyncio.get_running_loop()
-        path = f"/boxes/{box_id}?force=true" if force else f"/boxes/{box_id}"
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
+        path = f"/boxes/{encoded_id}?force=true" if force else f"/boxes/{encoded_id}"
         await loop.run_in_executor(None, self._request, "DELETE", path)
 
     async def exec(self, box_id: str, cmd: List[str]) -> ExecResultFallback:
         loop = asyncio.get_running_loop()
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
         command = cmd[0] if cmd else "sh"
         args = list(cmd[1:]) if len(cmd) > 1 else []
         body = {"command": command, "args": args}
-        res = await loop.run_in_executor(None, self._request, "POST", f"/boxes/{box_id}/exec", body)
+        res = await loop.run_in_executor(None, self._request, "POST", f"/boxes/{encoded_id}/exec", body)
         if not isinstance(res, dict):
             return ExecResultFallback(exit_code=0, stdout=str(res) if res is not None else "", stderr="")
         stdout = res.get("stdout") or res.get("stdOut") or res.get("output") or ""
@@ -219,9 +290,10 @@ class RestRuntimeFallback:
 
     async def copy_in(self, box_id: str, source: str, destination: str) -> bool:
         loop = asyncio.get_running_loop()
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
         try:
             body = {"source": source, "destination": destination}
-            await loop.run_in_executor(None, self._request, "POST", f"/boxes/{box_id}/copy-in", body)
+            await loop.run_in_executor(None, self._request, "POST", f"/boxes/{encoded_id}/copy-in", body)
             return True
         except Exception as e:
             raise RuntimeError(
@@ -232,7 +304,8 @@ class RestRuntimeFallback:
 
     async def tunnel(self, box_id: str, port: int, is_public: bool) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        path = f"/boxes/{box_id}/network/tunnel?port={port}"
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
+        path = f"/boxes/{encoded_id}/network/tunnel?port={port}"
         # OpenAPI schema requires camelCase 'isPublic' and additionalProperties: false
         body = {"isPublic": is_public} if not is_public else None
         res = await loop.run_in_executor(None, self._request, "POST", path, body)
@@ -240,20 +313,23 @@ class RestRuntimeFallback:
 
     async def revoke_tunnel(self, box_id: str, port: int) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        path = f"/boxes/{box_id}/network/tunnel?port={port}"
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
+        path = f"/boxes/{encoded_id}/network/tunnel?port={port}"
         await loop.run_in_executor(None, self._request, "DELETE", path)
         return {"revoked": True}
 
     async def update_inbound(self, box_id: str, mode: str) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
         body = {"mode": mode, "allow_net": []}
-        await loop.run_in_executor(None, self._request, "PUT", f"/boxes/{box_id}/network/inbound", body)
+        await loop.run_in_executor(None, self._request, "PUT", f"/boxes/{encoded_id}/network/inbound", body)
         return {"mode": mode}
 
     async def update_outbound(self, box_id: str, mode: str, allow_net: List[str]) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
+        encoded_id = urllib.parse.quote(str(box_id), safe="")
         body = {"mode": mode, "allow_net": allow_net}
-        await loop.run_in_executor(None, self._request, "PUT", f"/boxes/{box_id}/network/outbound", body)
+        await loop.run_in_executor(None, self._request, "PUT", f"/boxes/{encoded_id}/network/outbound", body)
         return {"mode": mode, "allow_net": allow_net}
 
     async def list_volumes(self) -> List[Dict[str, Any]]:
@@ -422,14 +498,14 @@ class RestRuntimeFallback:
         encoded_key = urllib.parse.quote(key, safe="")
         return await loop.run_in_executor(None, self._request, "POST", f"/domains/{encoded_key}/verify", {})
 
-    async def update_domain(self, key: str, box_id: Optional[str] = None, port: Optional[int] = None) -> Dict[str, Any]:
+    async def update_domain(self, key: str, box_id: Any = _UNSET, port: Any = _UNSET) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
         encoded_key = urllib.parse.quote(key, safe="")
         body: Dict[str, Any] = {}
-        if box_id is not None:
+        if box_id is not _UNSET:
             body["box_id"] = box_id if box_id else None
-        if port is not None:
-            body["port"] = int(port)
+        if port is not _UNSET:
+            body["port"] = int(port) if port is not None else None
         return await loop.run_in_executor(None, self._request, "PATCH", f"/domains/{encoded_key}", body)
 
     async def remove_domain(self, key: str) -> None:
@@ -585,23 +661,6 @@ class BoxLiteBridge:
         self.boxes[box_id] = box
         return box
 
-    async def handle_ping(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        return {"pong": True}
-
-    async def handle_check_credentials(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        rt = self.ensure_runtime()
-        boxes = await (rt.list_info() if hasattr(rt, "list_info") else rt.list())
-        items = []
-        for b in boxes:
-            if isinstance(b, dict):
-                b_id = b.get("id") or b.get("box_id") or ""
-                b_name = b.get("name") or ""
-            else:
-                b_id = getattr(b, "id", None) or getattr(b, "box_id", None) or str(b)
-                b_name = getattr(b, "name", "") or ""
-            items.append({"id": b_id, "name": b_name})
-        return {"valid": True, "boxCount": len(items)}
-
     async def handle_list_boxes(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         boxes = await (rt.list_info() if hasattr(rt, "list_info") else rt.list())
@@ -712,6 +771,8 @@ class BoxLiteBridge:
         image = args.get("image", "python")
         auto_remove = args.get("autoRemove", False)
         auto_stop = args.get("autoStop", args.get("auto_stop", 0))
+        if auto_stop is not None and 0 < auto_stop < 60:
+            auto_stop = 60
         auto_delete = args.get("autoDelete", args.get("auto_delete", 0))
         auto_resume = args.get("autoResume", args.get("auto_resume", True))
         cpus = args.get("cpus", args.get("cpu"))
@@ -745,12 +806,25 @@ class BoxLiteBridge:
 
             res = await rt.create(**kwargs)
             box_id = res.get("box_id") or res.get("id") or name
-            await rt.start(box_id)
+            try:
+                start_res = await rt.start(box_id)
+            except Exception as start_err:
+                if not name and _is_image_pull_error(str(start_err)) and box_id:
+                    try:
+                        await rt.remove(box_id, force=True)
+                    except Exception:
+                        pass
+                raise
+            resolved_image = (
+                (start_res.get("image") if isinstance(start_res, dict) else None)
+                or (res.get("image") if isinstance(res, dict) else None)
+                or image
+            )
             box = RestBoxFallback(rt, box_id, name or box_id)
             self.boxes[box_id] = box
             if redacted_secrets:
                 self.box_secrets[box_id] = redacted_secrets
-            return {"boxId": box_id, "name": name or box_id, "status": "running"}
+            return {"boxId": box_id, "name": name or box_id, "status": "running", "image": resolved_image}
 
         import boxlite
         outbound_spec = None
@@ -824,10 +898,20 @@ class BoxLiteBridge:
         if sdk_secrets:
             kwargs["secrets"] = sdk_secrets
 
+        resolved_image = image
         try:
             box = boxlite.SimpleBox(**kwargs)
-            await box.start()
+            try:
+                await box.start()
+            except Exception as start_err:
+                if not name and _is_image_pull_error(str(start_err)) and getattr(box, "id", None):
+                    try:
+                        await rt.remove(box.id, force=True)
+                    except Exception:
+                        pass
+                raise
             box_id = box.id
+            resolved_image = getattr(box, "image", None) or image
             self.boxes[box_id] = box
         except TypeError as e:
             if sdk_secrets:
@@ -862,10 +946,21 @@ class BoxLiteBridge:
                         box_opts_kwargs["volumes"] = kwargs["volumes"]
                     create_kwargs = {"name": name} if name else {}
                     box = await rt.create(boxlite.BoxOptions(**box_opts_kwargs), **create_kwargs)
-                    await box.start()
+                    try:
+                        await box.start()
+                    except Exception as start_err:
+                        if not name and _is_image_pull_error(str(start_err)) and getattr(box, "id", None):
+                            try:
+                                await rt.remove(box.id, force=True)
+                            except Exception:
+                                pass
+                        raise
                     box_id = box.id
+                    resolved_image = getattr(box, "image", None) or image
                     self.boxes[box_id] = box
                 except Exception as inner_e:
+                    if not isinstance(inner_e, TypeError) and _is_image_pull_error(str(inner_e)):
+                        raise
                     log_debug(f"BoxOptions with secrets failed ({inner_e}); falling back to REST")
                     fallback = self._rest_fallback(rt)
                     rest_kwargs = self._build_rest_create_kwargs(
@@ -886,7 +981,20 @@ class BoxLiteBridge:
                     )
                     res = await fallback.create(**rest_kwargs)
                     box_id = res.get("box_id") or res.get("id") or name
-                    await fallback.start(box_id)
+                    try:
+                        start_res = await fallback.start(box_id)
+                    except Exception as start_err:
+                        if not name and _is_image_pull_error(str(start_err)) and box_id:
+                            try:
+                                await fallback.remove(box_id, force=True)
+                            except Exception:
+                                pass
+                        raise
+                    resolved_image = (
+                        (start_res.get("image") if isinstance(start_res, dict) else None)
+                        or (res.get("image") if isinstance(res, dict) else None)
+                        or image
+                    )
                     box = RestBoxFallback(fallback, box_id, name or box_id)
                     self.boxes[box_id] = box
             else:
@@ -899,8 +1007,17 @@ class BoxLiteBridge:
                 except TypeError:
                     kwargs.pop("auto_stop", None)
                     box = boxlite.SimpleBox(**kwargs)
-                await box.start()
+                try:
+                    await box.start()
+                except Exception as start_err:
+                    if not name and _is_image_pull_error(str(start_err)) and getattr(box, "id", None):
+                        try:
+                            await rt.remove(box.id, force=True)
+                        except Exception:
+                            pass
+                    raise
                 box_id = box.id
+                resolved_image = getattr(box, "image", None) or image
                 self.boxes[box_id] = box
 
         if redacted_secrets:
@@ -909,7 +1026,8 @@ class BoxLiteBridge:
         return {
             "boxId": box_id,
             "name": name or box_id,
-            "status": "running"
+            "status": "running",
+            "image": resolved_image,
         }
 
     async def handle_start_box(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -954,12 +1072,58 @@ class BoxLiteBridge:
         return {"boxId": box_id, "status": "stopped"}
 
     async def handle_remove_box(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        box_id = args["boxId"]
+        target = args.get("boxId") or args.get("boxName")
+        if not target:
+            raise ValueError("boxId or boxName is required")
+        ignore_not_found = bool(args.get("ignoreNotFound", False))
         rt = self.ensure_runtime()
-        await rt.remove(box_id, force=True)
-        if box_id in self.boxes:
-            del self.boxes[box_id]
-        return {"boxId": box_id, "removed": True}
+        removed_id = target
+
+        try:
+            await rt.remove(target, force=True)
+        except Exception as e:
+            if not _is_not_found_error(e):
+                raise
+            matched_id = None
+            try:
+                boxes = await (rt.list_info() if hasattr(rt, "list_info") else rt.list())
+                for b in (boxes or []):
+                    if isinstance(b, dict):
+                        b_id = b.get("id") or b.get("box_id")
+                        b_name = b.get("name")
+                    else:
+                        b_id = getattr(b, "id", None) or getattr(b, "box_id", None)
+                        b_name = getattr(b, "name", None)
+                    if b_name == target or b_id == target:
+                        matched_id = b_id
+                        break
+            except Exception:
+                matched_id = None
+
+            if matched_id and matched_id != target:
+                try:
+                    await rt.remove(matched_id, force=True)
+                    removed_id = matched_id
+                except Exception as remove_err:
+                    if _is_not_found_error(remove_err) and ignore_not_found:
+                        self.boxes.pop(target, None)
+                        self.boxes.pop(matched_id, None)
+                        self.box_secrets.pop(target, None)
+                        self.box_secrets.pop(matched_id, None)
+                        return {"boxId": target, "removed": False, "notFound": True}
+                    raise
+            else:
+                if ignore_not_found:
+                    self.boxes.pop(target, None)
+                    self.box_secrets.pop(target, None)
+                    return {"boxId": target, "removed": False, "notFound": True}
+                raise
+
+        self.boxes.pop(target, None)
+        self.boxes.pop(removed_id, None)
+        self.box_secrets.pop(target, None)
+        self.box_secrets.pop(removed_id, None)
+        return {"boxId": removed_id, "removed": True}
 
     async def handle_exec(self, args: Dict[str, Any]) -> Dict[str, Any]:
         box_id = args["boxId"]
@@ -1118,14 +1282,17 @@ class BoxLiteBridge:
                     "status": status,
                     "stopped": True
                 }
-        except Exception:
-            return {
-                "boxId": box_id,
-                "content": "",
-                "exitCode": 0,
-                "status": "stopped",
-                "stopped": True
-            }
+        except Exception as err:
+            lower_err = str(err).lower()
+            if "404" in lower_err or "not found" in lower_err:
+                return {
+                    "boxId": box_id,
+                    "content": "",
+                    "exitCode": 0,
+                    "status": "stopped",
+                    "stopped": True
+                }
+            raise
 
         res = await box.exec("tail", f"-n{lines}", log_file)
         if hasattr(res, "wait") and callable(res.wait):
@@ -1351,6 +1518,8 @@ class BoxLiteBridge:
         if size_bytes is None:
             size_bytes = get_field("size_bytes")
 
+        digest = get_field("digest")
+
         formatted: Dict[str, Any] = dict(img) if isinstance(img, dict) else {}
         formatted.update({
             "name": name,
@@ -1359,15 +1528,23 @@ class BoxLiteBridge:
             "lastUsedAt": last_used,
             "sizeBytes": size_bytes,
         })
+        if isinstance(digest, str) and digest.strip():
+            formatted["digest"] = digest.strip()
         return formatted
+
+    def _get_images_handle(self, rt: Any) -> Any:
+        if hasattr(rt, "images"):
+            attr = getattr(rt, "images")
+            return attr() if callable(attr) else attr
+        return None
 
     async def handle_list_images(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
-        images = []
+        images = None
         usage = None
 
-        if hasattr(rt, "images"):
-            img_mgr = getattr(rt, "images")
+        img_mgr = self._get_images_handle(rt)
+        if img_mgr is not None:
             if hasattr(img_mgr, "list") and callable(img_mgr.list):
                 try:
                     images = await img_mgr.list()
@@ -1384,10 +1561,11 @@ class BoxLiteBridge:
                 except Exception as e:
                     log_debug(f"rt.images.usage() failed: {e}")
 
-        if not images and not usage:
+        if images is None:
             fallback_res = await self._rest_fallback(rt).list_images()
             images = fallback_res.get("images", [])
-            usage = fallback_res.get("usage")
+            if usage is None:
+                usage = fallback_res.get("usage")
 
         formatted_images = []
         for img in (images or []):
@@ -1413,65 +1591,99 @@ class BoxLiteBridge:
     async def handle_inspect_image(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         name = args["name"]
-        data = None
+        canonical = _canonical_catalog_image_name(name)
+        candidates = [name] if not canonical or canonical == name else [name, canonical]
+        img_mgr = self._get_images_handle(rt)
+        last_err: Optional[Exception] = None
 
-        if hasattr(rt, "images") and hasattr(getattr(rt, "images"), "get"):
-            try:
-                img_mgr = getattr(rt, "images")
-                detail = await img_mgr.get(name)
-                if hasattr(detail, "to_dict"):
-                    data = detail.to_dict()
-                elif hasattr(detail, "__dict__"):
-                    data = {k: v for k, v in detail.__dict__.items() if not k.startswith("_")}
-                else:
-                    data = {
-                        "name": getattr(detail, "name", name),
-                        "versions": [
-                            {
-                                "digest": getattr(v, "digest", ""),
-                                "lastUsedAt": getattr(v, "last_used_at", getattr(v, "lastUsedAt", None)),
-                                "sizeBytes": getattr(v, "size_bytes", getattr(v, "sizeBytes", None))
-                            }
-                            for v in getattr(detail, "versions", [])
-                        ],
-                        "aliases": [
-                            {
-                                "alias": getattr(a, "alias", ""),
-                                "digest": getattr(a, "digest", "")
-                            }
-                            for a in getattr(detail, "aliases", [])
-                        ],
-                        "history": [
-                            {
-                                "alias": getattr(h, "alias", ""),
-                                "fromDigest": getattr(h, "from_digest", getattr(h, "fromDigest", None)),
-                                "toDigest": getattr(h, "to_digest", getattr(h, "toDigest", "")),
-                                "recordedAt": getattr(h, "recorded_at", getattr(h, "recordedAt", None))
-                            }
-                            for h in getattr(detail, "history", [])
-                        ]
-                    }
-            except Exception as e:
-                log_debug(f"rt.images.get() failed ({e}), falling back to REST")
+        for candidate in candidates:
+            data = None
+            if img_mgr is not None and hasattr(img_mgr, "get"):
+                try:
+                    detail = await img_mgr.get(candidate)
+                    if hasattr(detail, "to_dict"):
+                        data = detail.to_dict()
+                    elif hasattr(detail, "__dict__"):
+                        data = {k: v for k, v in detail.__dict__.items() if not k.startswith("_")}
+                    else:
+                        data = {
+                            "name": getattr(detail, "name", candidate),
+                            "versions": [
+                                {
+                                    "digest": getattr(v, "digest", ""),
+                                    "lastUsedAt": self._serialize_timestamp(
+                                        getattr(v, "last_used_at", getattr(v, "lastUsedAt", None))
+                                    ),
+                                    "sizeBytes": getattr(v, "size_bytes", getattr(v, "sizeBytes", None))
+                                }
+                                for v in getattr(detail, "versions", [])
+                            ],
+                            "aliases": [
+                                {
+                                    "alias": getattr(a, "alias", ""),
+                                    "digest": getattr(a, "digest", "")
+                                }
+                                for a in getattr(detail, "aliases", [])
+                            ],
+                            "history": [
+                                {
+                                    "alias": getattr(h, "alias", ""),
+                                    "fromDigest": getattr(h, "from_digest", getattr(h, "fromDigest", None)),
+                                    "toDigest": getattr(h, "to_digest", getattr(h, "toDigest", "")),
+                                    "recordedAt": self._serialize_timestamp(
+                                        getattr(h, "recorded_at", getattr(h, "recordedAt", None))
+                                    )
+                                }
+                                for h in getattr(detail, "history", [])
+                            ]
+                        }
+                except Exception as e:
+                    last_err = e
+                    log_debug(f"rt.images.get({candidate}) failed ({e}), falling back to REST")
 
-        if data is None:
-            data = await self._rest_fallback(rt).get_image(name)
+            if data is None:
+                try:
+                    data = await self._rest_fallback(rt).get_image(candidate)
+                except Exception as e:
+                    last_err = e
+                    if _is_not_found_error(e) and candidate != candidates[-1]:
+                        continue
+                    raise
 
-        return {"image": data}
+            return {"image": data}
+
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError(f"Image '{name}' not found")
 
     async def handle_remove_image(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         name = args["name"]
-        if hasattr(rt, "images"):
-            img_mgr = getattr(rt, "images")
-            if hasattr(img_mgr, "remove") and callable(img_mgr.remove):
-                try:
-                    await img_mgr.remove(name)
-                    return {"name": name, "removed": True}
-                except Exception as e:
-                    log_debug(f"rt.images.remove() failed ({e}), falling back to REST")
+        canonical = _canonical_catalog_image_name(name)
+        candidates = [name] if not canonical or canonical == name else [name, canonical]
+        img_mgr = self._get_images_handle(rt)
+        last_err: Optional[Exception] = None
 
-        await self._rest_fallback(rt).remove_image(name)
+        for candidate in candidates:
+            if img_mgr is not None and hasattr(img_mgr, "remove") and callable(img_mgr.remove):
+                try:
+                    await img_mgr.remove(candidate)
+                    return {"name": candidate, "removed": True}
+                except Exception as e:
+                    last_err = e
+                    log_debug(f"rt.images.remove({candidate}) failed ({e}), falling back to REST")
+
+            try:
+                await self._rest_fallback(rt).remove_image(candidate)
+                return {"name": candidate, "removed": True}
+            except Exception as e:
+                last_err = e
+                if _is_not_found_error(e) and candidate != candidates[-1]:
+                    continue
+                raise
+
+        if last_err is not None:
+            raise last_err
         return {"name": name, "removed": True}
 
     async def handle_create_image_alias(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1479,32 +1691,62 @@ class BoxLiteBridge:
         name = args["name"]
         alias = args["alias"]
         digest = args["digest"]
-        if hasattr(rt, "images"):
-            img_mgr = getattr(rt, "images")
-            if hasattr(img_mgr, "create_alias") and callable(img_mgr.create_alias):
-                try:
-                    await img_mgr.create_alias(name=name, alias=alias, digest=digest)
-                    return {"name": name, "alias": alias, "digest": digest}
-                except Exception as e:
-                    log_debug(f"rt.images.create_alias() failed ({e}), falling back to REST")
+        canonical = _canonical_catalog_image_name(name)
+        candidates = [name] if not canonical or canonical == name else [name, canonical]
+        img_mgr = self._get_images_handle(rt)
+        last_err: Optional[Exception] = None
 
-        await self._rest_fallback(rt).create_image_alias(name, alias, digest)
+        for candidate in candidates:
+            if img_mgr is not None and hasattr(img_mgr, "create_alias") and callable(img_mgr.create_alias):
+                try:
+                    await img_mgr.create_alias(name=candidate, alias=alias, digest=digest)
+                    return {"name": candidate, "alias": alias, "digest": digest}
+                except Exception as e:
+                    last_err = e
+                    log_debug(f"rt.images.create_alias({candidate}) failed ({e}), falling back to REST")
+
+            try:
+                await self._rest_fallback(rt).create_image_alias(candidate, alias, digest)
+                return {"name": candidate, "alias": alias, "digest": digest}
+            except Exception as e:
+                last_err = e
+                if _is_not_found_error(e) and candidate != candidates[-1]:
+                    continue
+                raise
+
+        if last_err is not None:
+            raise last_err
         return {"name": name, "alias": alias, "digest": digest}
 
     async def handle_delete_image_alias(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         name = args["name"]
         alias = args["alias"]
-        if hasattr(rt, "images"):
-            img_mgr = getattr(rt, "images")
-            if hasattr(img_mgr, "delete_alias") and callable(img_mgr.delete_alias):
-                try:
-                    await img_mgr.delete_alias(name=name, alias=alias)
-                    return {"name": name, "alias": alias, "deleted": True}
-                except Exception as e:
-                    log_debug(f"rt.images.delete_alias() failed ({e}), falling back to REST")
+        canonical = _canonical_catalog_image_name(name)
+        candidates = [name] if not canonical or canonical == name else [name, canonical]
+        img_mgr = self._get_images_handle(rt)
+        last_err: Optional[Exception] = None
 
-        await self._rest_fallback(rt).delete_image_alias(name, alias)
+        for candidate in candidates:
+            if img_mgr is not None and hasattr(img_mgr, "delete_alias") and callable(img_mgr.delete_alias):
+                try:
+                    await img_mgr.delete_alias(name=candidate, alias=alias)
+                    return {"name": candidate, "alias": alias, "deleted": True}
+                except Exception as e:
+                    last_err = e
+                    log_debug(f"rt.images.delete_alias({candidate}) failed ({e}), falling back to REST")
+
+            try:
+                await self._rest_fallback(rt).delete_image_alias(candidate, alias)
+                return {"name": candidate, "alias": alias, "deleted": True}
+            except Exception as e:
+                last_err = e
+                if _is_not_found_error(e) and candidate != candidates[-1]:
+                    continue
+                raise
+
+        if last_err is not None:
+            raise last_err
         return {"name": name, "alias": alias, "deleted": True}
 
     async def handle_create_registry_login(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1865,13 +2107,18 @@ class BoxLiteBridge:
     async def handle_update_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         key = args["domainKey"]
-        box_id = args.get("boxId")
-        port = args.get("port")
+        box_id = args["boxId"] if "boxId" in args else _UNSET
+        port = args["port"] if "port" in args else _UNSET
 
         handle = self._get_domain_handle(rt)
         if handle is not None and hasattr(handle, "update") and callable(handle.update):
             try:
-                info = await handle.update(key, box_id=box_id, port=port)
+                sdk_kwargs: Dict[str, Any] = {}
+                if box_id is not _UNSET:
+                    sdk_kwargs["box_id"] = box_id
+                if port is not _UNSET:
+                    sdk_kwargs["port"] = port
+                info = await handle.update(key, **sdk_kwargs)
                 return self._format_domain(info)
             except Exception as e:
                 log_debug(f"rt.domains.update() failed ({e}), falling back to REST")
@@ -1924,7 +2171,19 @@ class BoxLiteBridge:
             # Formulate structured diagnostic guidance according to §5
             diagnosis = None
             lower_msg = message.lower()
-            if "box networking is disabled" in lower_msg or "no guest nic" in lower_msg:
+            if _is_image_pull_error(message):
+                diagnosis = (
+                    "Image pull failed: (1) check the reference for typos (short names default to Docker Hub; "
+                    "base, python, and node are BoxLite built-ins), (2) if the image is private, register a "
+                    "registry login via 'BoxLite: Connect Private Registry...', (3) verify the tag exists. "
+                    "Note: a create that fails on its image still leaves the box behind — remove it by the box name passed to create()."
+                )
+            elif _is_image_catalog_limit_error(message):
+                diagnosis = (
+                    "Image catalog limit reached: each organization catalog holds up to 20 recorded custom images. "
+                    "Remove unused custom images before booting a new image (docs.boxlite.ai/cloud/image-catalog)."
+                )
+            elif "box networking is disabled" in lower_msg or "no guest nic" in lower_msg:
                 diagnosis = (
                     "Box networking is permanently disabled: this box was created with Outbound Network disabled "
                     "(no guest NIC provisioned at creation, e.g. Quick Create or Air-Gapped mode). Network policies "

@@ -3,6 +3,35 @@ export interface DiagnosticMessage {
   checklist: string[];
 }
 
+export function isImagePullError(errOrMessage: unknown): boolean {
+  const message =
+    errOrMessage instanceof Error ? errOrMessage.message : String(errOrMessage ?? '');
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('failed to pull image') ||
+    lower.includes('refused the pull') ||
+    lower.includes('no registry login') ||
+    lower.includes('manifest unknown') ||
+    lower.includes('pull access denied') ||
+    lower.includes('repository does not exist') ||
+    (lower.includes('box state transition failed') &&
+      (lower.includes('pull') || lower.includes('image')))
+  );
+}
+
+export function isImageCatalogLimitError(errOrMessage: unknown): boolean {
+  const message =
+    errOrMessage instanceof Error ? errOrMessage.message : String(errOrMessage ?? '');
+  const lower = message.toLowerCase();
+  return (
+    (lower.includes('image') || lower.includes('catalog')) &&
+    (lower.includes('limit') ||
+      lower.includes('quota') ||
+      lower.includes('20 images') ||
+      lower.includes('maximum'))
+  );
+}
+
 export function formatErrorWithDiagnosis(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err ?? '');
   if (message.includes('Diagnosis:')) {
@@ -14,6 +43,30 @@ export function formatErrorWithDiagnosis(err: unknown): string {
 
 export function diagnoseError(errorMessage: string, code?: string): DiagnosticMessage {
   const lower = errorMessage.toLowerCase();
+
+  // Check image pull errors before 401/unauthorized because registry pull refusals
+  // include "(UNAUTHORIZED)" when an image is private, missing, or untagged.
+  if (isImagePullError(errorMessage)) {
+    return {
+      summary: 'Image Pull Failed',
+      checklist: [
+        'Check the image reference for typos (short names default to Docker Hub; base, python, and node are BoxLite built-ins)',
+        'If the image is private, register a registry login via "BoxLite: Connect Private Registry..." (docs.boxlite.ai/cloud/private-images)',
+        'Verify that the requested tag or digest exists in the registry',
+        'A create that fails on its image still leaves the box behind without returning its ID — remove it by the box name passed to create()'
+      ]
+    };
+  }
+
+  if (isImageCatalogLimitError(errorMessage)) {
+    return {
+      summary: 'Image Catalog Limit Reached (20 images)',
+      checklist: [
+        'Each organization catalog holds up to 20 recorded custom images (built-in images and aliases do not count)',
+        'Remove unused custom images from the Images view before booting a new custom image (docs.boxlite.ai/cloud/image-catalog)'
+      ]
+    };
+  }
 
   if (lower.includes('certificate_verify_failed') || lower.includes('ssl') && lower.includes('cafile') || lower.includes('ca-certificates')) {
     return {

@@ -123,6 +123,7 @@ export interface ImageHistoryEvent {
 export interface ImageItem {
   name: string;
   tags?: string[];
+  digest?: string;
   boxCount?: number;
   lastUsedAt?: string;
   sizeBytes?: number;
@@ -130,6 +131,17 @@ export interface ImageItem {
   recorded?: boolean;
   isDefault?: boolean;
   boxes?: { id: string; name: string; status: string }[];
+}
+
+export interface CreateBoxResult {
+  boxId: string;
+  name: string;
+  status: string;
+  image?: string;
+}
+
+export interface RemoveBoxOptions {
+  ignoreNotFound?: boolean;
 }
 
 export interface ImageDetail extends ImageItem {

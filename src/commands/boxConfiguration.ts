@@ -8,6 +8,7 @@ import {
   formatSecretPlaceholder,
   validateAllowlistRule,
   validateEnvAgainstSecrets,
+  validateImageReference,
   validateNetworkPolicy,
   validateSecretHeaders,
   validateSecretHosts,
@@ -78,28 +79,28 @@ export const SIZING_PRESETS: Record<
 export const STANDARD_IMAGES = [
   {
     label: 'python',
-    description: 'Python 3 Standard Environment (agent.md §1 canonical)',
-    detail: 'Fast startup, standard library, ideal for Python HTTP servers and agents'
+    description: 'BoxLite Built-in Python 3 (free · not Docker Hub)',
+    detail: 'BoxLite built-in image: fast startup, standard library; use docker.io/library/python:3.12-slim for Docker Hub'
   },
   {
     label: 'node',
-    description: 'Node.js Runtime (LTS)',
-    detail: 'Pre-configured with Node.js and npm for JavaScript/TypeScript services'
+    description: 'BoxLite Built-in Node.js (free · not Docker Hub)',
+    detail: 'BoxLite built-in image: Node.js and npm; use docker.io/library/node:22-slim for Docker Hub'
   },
   {
     label: 'ubuntu',
-    description: 'Ubuntu Linux Cloud Environment',
-    detail: 'Ubuntu base image suitable for general CLI tooling and utilities'
+    description: 'Docker Hub Ubuntu (docker.io/library/ubuntu:latest)',
+    detail: 'Public OCI image from Docker Hub suitable for general CLI tooling and utilities'
   },
   {
     label: 'debian',
-    description: 'Debian Linux Slim Environment',
-    detail: 'Lightweight Debian container base'
+    description: 'Docker Hub Debian (docker.io/library/debian:latest)',
+    detail: 'Lightweight Debian container base from Docker Hub'
   },
   {
     label: 'alpine',
-    description: 'Alpine Linux (Minimal)',
-    detail: 'Extremely small image footprint, ideal for isolated utilities'
+    description: 'Docker Hub Alpine (docker.io/library/alpine:latest)',
+    detail: 'Minimal Alpine Linux OCI image from Docker Hub'
   }
 ];
 
@@ -624,11 +625,20 @@ async function promptForImage(current: BoxConfiguration) {
 
   if (selected.isCustom) {
     const custom = await vscode.window.showInputBox({
-      prompt: 'Enter container image tag (e.g. python:3.12-slim)',
-      value: current.image
+      prompt: 'Enter OCI image reference (e.g. docker.io/library/alpine:3.20, docker.io/library/python:3.12-slim, ghcr.io/acme/api:1.4.0)',
+      value: current.image,
+      validateInput: (v) => {
+        const check = validateImageReference(v);
+        return check.valid ? null : check.error || 'Invalid image reference';
+      }
     });
     if (custom && custom.trim()) {
-      current.image = custom.trim();
+      const trimmed = custom.trim();
+      const check = validateImageReference(trimmed);
+      if (check.warning) {
+        vscode.window.showWarningMessage(check.warning);
+      }
+      current.image = trimmed;
     }
   } else {
     current.image = selected.label;

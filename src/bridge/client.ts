@@ -8,6 +8,8 @@ import {
   BridgeResponse,
   BoxListItem,
   CreateBoxArgs,
+  CreateBoxResult,
+  RemoveBoxOptions,
   ExecResult,
   TunnelResult,
   TailLogResult,
@@ -305,8 +307,8 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
     return res.box;
   }
 
-  public async createBox(args: CreateBoxArgs): Promise<{ boxId: string; name: string; status: string }> {
-    return this.sendRequest('create_box', args, 120000);
+  public async createBox(args: CreateBoxArgs): Promise<CreateBoxResult> {
+    return this.sendRequest<CreateBoxResult>('create_box', args, 120000);
   }
 
   public async startBox(boxId: string): Promise<{ boxId: string; status: string }> {
@@ -317,8 +319,15 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
     return this.sendRequest('stop_box', { boxId }, 30000);
   }
 
-  public async removeBox(boxId: string): Promise<{ boxId: string; removed: boolean }> {
-    return this.sendRequest('remove_box', { boxId }, 30000);
+  public async removeBox(
+    boxId: string,
+    options?: RemoveBoxOptions
+  ): Promise<{ boxId: string; removed: boolean; notFound?: boolean }> {
+    return this.sendRequest<{ boxId: string; removed: boolean; notFound?: boolean }>(
+      'remove_box',
+      { boxId, ignoreNotFound: Boolean(options?.ignoreNotFound) },
+      30000
+    );
   }
 
   public async exec(boxId: string, command: string, args: string[] = []): Promise<ExecResult> {

@@ -84,6 +84,28 @@ class TestRestRuntimeFallback(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res["images"], [{"name": "python:alpine"}])
             self.assertIsNone(res["usage"])
 
+    async def test_create_start_use_longer_timeout_and_remove_url_encodes_box_target(self):
+        rt = bridge.RestRuntimeFallback("https://api.boxlite.ai", "bl_test_key")
+        calls = []
+
+        def fake_urlopen(req, timeout=30):
+            calls.append((req.get_method(), req.full_url, timeout))
+            return FakeHttpResponse({"id": "box_123"})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await rt.create(image="docker.io/library/alpine:3.20", name="demo box")
+            await rt.start("box_123")
+            await rt.remove("demo box", force=True)
+
+        self.assertEqual(
+            calls,
+            [
+                ("POST", "https://api.boxlite.ai/v1/boxes", 120),
+                ("POST", "https://api.boxlite.ai/v1/boxes/box_123/start", 120),
+                ("DELETE", "https://api.boxlite.ai/v1/boxes/demo%20box?force=true", 30),
+            ],
+        )
+
 
 class TestBoxLiteBridge(unittest.IsolatedAsyncioTestCase):
     async def test_handle_tail_log_uses_box_inspect_when_rt_lacks_inspect(self):
@@ -173,6 +195,114 @@ class TestBoxLiteBridge(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(fb, bridge.RestRuntimeFallback)
             self.assertEqual(fb.rest_url, "https://custom.boxlite.ai")
             self.assertEqual(fb.api_key, "k1")
+
+    async def test_handle_remove_box_falls_back_to_lookup_by_name_and_ignore_not_found(self):
+        br = bridge.BoxLiteBridge()
+
+        class FakeRuntime:
+            def __init__(self):
+                self.removed = []
+
+            async def remove(self, target, force=False):
+                if target == "demo-failed":
+                    raise RuntimeError("BoxLite Cloud API error (404): box not found")
+                self.removed.append((target, force))
+
+            async def list_info(self):
+                return [{"id": "box_orphan_99", "name": "demo-failed", "status": "stopped"}]
+
+        rt = FakeRuntime()
+        br.rt = rt
+        res = await br.handle_remove_box({"boxId": "demo-failed", "ignoreNotFound": True})
+        self.assertEqual(res, {"boxId": "box_orphan_99", "removed": True})
+        self.assertEqual(rt.removed, [("box_orphan_99", True)])
+
+        class MissingRuntime:
+            async def remove(self, target, force=False):
+                raise RuntimeError("BoxLite Cloud API error (404): not found")
+
+            async def list_info(self):
+                return []
+
+        br.rt = MissingRuntime()
+        res_missing = await br.handle_remove_box({"boxId": "no-such-box", "ignoreNotFound": True})
+        self.assertEqual(res_missing, {"boxId": "no-such-box", "removed": False, "notFound": True})
+
+    async def test_handle_list_images_falls_back_to_rest_when_sdk_list_fails_even_if_usage_succeeds(self):
+        br = bridge.BoxLiteBridge()
+
+        class FakeUsage:
+            count = 1
+            limit = 20
+            known_bytes = 3630321
+
+        class FakeImagesMgr:
+            async def list(self):
+                raise RuntimeError("SDK list failed")
+
+            async def usage(self):
+                return FakeUsage()
+
+        class FakeNativeRuntime:
+            images = FakeImagesMgr()
+
+        br.rt = FakeNativeRuntime()
+
+        def fake_urlopen(req, timeout=30):
+            if req.full_url.endswith("/images/usage"):
+                return FakeHttpResponse({"count": 1, "limit": 20, "known_bytes": 3630321})
+            return FakeHttpResponse({"images": [{"name": "docker.io/library/alpine", "size_bytes": 3630321}]})
+
+        with patch.dict(os.environ, {"BOXLITE_REST_URL": "https://api.boxlite.ai", "BOXLITE_API_KEY": "k1"}):
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                res = await br.handle_list_images({})
+                self.assertEqual(len(res["images"]), 1)
+                self.assertEqual(res["images"][0]["name"], "docker.io/library/alpine")
+                self.assertEqual(res["usage"]["count"], 1)
+
+    async def test_handle_inspect_image_retries_with_canonical_name_on_404(self):
+        br = bridge.BoxLiteBridge()
+        br.rt = bridge.RestRuntimeFallback("https://api.boxlite.ai", "bl_key")
+        requested_urls = []
+
+        def fake_urlopen(req, timeout=30):
+            requested_urls.append(req.full_url)
+            if req.full_url.endswith("%3A3.20"):
+                raise urllib.error.HTTPError(
+                    req.full_url, 404, "Not Found", hdrs=None, fp=io.BytesIO(b'{"message":"not found"}')
+                )
+            return FakeHttpResponse({"name": "docker.io/library/alpine", "versions": [{"digest": "sha256:" + "a" * 64}]})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = await br.handle_inspect_image({"name": "docker.io/library/alpine:3.20"})
+
+        self.assertEqual(res["image"]["name"], "docker.io/library/alpine")
+        self.assertEqual(
+            requested_urls,
+            [
+                "https://api.boxlite.ai/v1/images/docker.io%2Flibrary%2Falpine%3A3.20",
+                "https://api.boxlite.ai/v1/images/docker.io%2Flibrary%2Falpine",
+            ],
+        )
+
+    async def test_dispatch_diagnoses_image_pull_unauthorized_without_api_key_misattribution(self):
+        br = bridge.BoxLiteBridge()
+
+        async def fail_create(_args):
+            raise RuntimeError(
+                "Box state transition failed: Failed to pull image 'acme/api:1.4.0': docker.io refused the pull (UNAUTHORIZED)."
+            )
+
+        br.handle_create_box = fail_create
+        captured = []
+        with patch.object(bridge, "send_response", side_effect=lambda req_id, ok, data=None, error=None: captured.append((req_id, ok, error))):
+            await br.dispatch({"id": "req_1", "op": "create_box", "args": {}})
+
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(captured[0][1])
+        diag = captured[0][2]["diagnosis"]
+        self.assertIn("Image pull failed", diag)
+        self.assertNotIn("401 Unauthorized", diag)
 
 
 if __name__ == "__main__":

@@ -182,9 +182,11 @@ When creating a Box via `BoxLite: Create Box with Options...` (or by choosing **
   - `node`: Node.js runtime, ready for JavaScript/TypeScript services.
   - `sandbaseai-hermes`: Official Hermes agent image preinstalled.
   *Note:* Built-in images are free and do not count against your organization's 20-image catalog limit.
-- **Using Custom Images:** Any OCI container image from a public registry can be booted with no approval or manual upload required (e.g. `docker.io/library/alpine:3.20` or `ghcr.io/acme/api:1.4.0`).
-- **Namespace Shadowing Notice:** The short aliases `base`, `python`, and `node` refer to BoxLite's built-in images, not Docker Hub's. To boot an official image from Docker Hub, specify its full reference (e.g. `docker.io/library/python:3.12-slim`).
-- **Catalog Lifecycle & Boot Recording Delay:** The first time a box boots an image, it is recorded in your organization catalog. Recording occurs when the microVM finishes booting (~12 seconds after launch), not when creation returns.
+- **Images & Catalog Workflow (Zero-CLI Built-in API):**
+  - Uses the extension's built-in Python SDK / Cloud REST API directly without requiring the `boxlite` CLI (`boxlite run` or `boxlite images`).
+  - Short names default to Docker Hub (`alpine` -> `docker.io/library/alpine:latest`), while `base`, `python`, `node`, and `sandbaseai-hermes` refer to BoxLite's built-in images (the extension warns before booting shadowed names so you can choose Docker Hub e.g. `docker.io/library/python:3.12-slim` instead).
+  - **Catalog Boot Recording & Digest Readback:** After booting a custom image, the extension polls the catalog (~12s recording lag) and surfaces the exact recorded `sha256` digest readback.
+  - **Pull Failure Cleanup:** If an image pull fails (typo, private registry needing a login, or missing tag), the extension explains the cause and automatically removes the leftover failed box by the name passed to `create()`.
 - **Organization Quota:** Catalogs support up to 20 recorded custom images. Images unused by active boxes can be safely deleted via the context menu.
 - **Build Pinning & Rollbacks (Aliases):** Attach named aliases (e.g. `stable`, `prod`) to exact sha256 digests. Moving an alias promotes or rolls back production deployments instantly without touching external registries.
 - **Private Registries:** Register credentials for private image repositories on `ghcr.io`, `docker.io`, `quay.io`, and `gcr.io`. Password/token credentials are write-only and require a Full-access Cloud API key.
