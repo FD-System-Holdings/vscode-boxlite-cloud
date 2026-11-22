@@ -752,6 +752,7 @@ describe('Use Your Own Image Workflow (Zero-CLI Built-in API)', () => {
       assert.strictEqual(createdBoxArgs.length, 1);
       assert.strictEqual(createdBoxArgs[0].image, 'docker.io/library/python:latest');
       assert.strictEqual(createdBoxArgs[0].name, 'demo');
+      assert.strictEqual(createdBoxArgs[0].diskSizeGb, 10);
       assert.strictEqual(createdBoxArgs[0].entrypoint, undefined);
       assert.ok(savedCustomImages.includes('docker.io/library/python:latest'));
       assert.ok(infoMessages.some((m) => m.includes('docker.io/library/python@sha256:c64c687cbea9…')));
@@ -766,6 +767,71 @@ describe('Use Your Own Image Workflow (Zero-CLI Built-in API)', () => {
       vscode.window.showInputBox = origShowInputBox;
       vscode.window.showQuickPick = origShowQuickPick;
       vscode.window.showWarningMessage = origShowWarningMessage;
+      vscode.window.showInformationMessage = origShowInformationMessage;
+      vscode.window.showErrorMessage = origShowErrorMessage;
+    }
+  });
+
+  it('caps runUseYourOwnImageFlow immediate start at 10 GB even when boxlite.defaultDisk is configured to 20', async () => {
+    const vscode = require('vscode');
+    const origGetConfiguration = vscode.workspace.getConfiguration;
+    const origShowInputBox = vscode.window.showInputBox;
+    const origShowQuickPick = vscode.window.showQuickPick;
+    const origShowInformationMessage = vscode.window.showInformationMessage;
+    const origShowErrorMessage = vscode.window.showErrorMessage;
+
+    const createdBoxArgs: any[] = [];
+    try {
+      vscode.workspace.getConfiguration = () => ({
+        get: (key: string, def: any) => (key === 'defaultDisk' ? 20 : def),
+        update: async () => {}
+      });
+
+      let step = 0;
+      vscode.window.showInputBox = async () => (++step === 1 ? 'docker.io/library/rileycarney/rc-typing-app:latest' : 'rc-typing');
+      vscode.window.showQuickPick = async (items: any[]) => items.find((i) => i.action === 'create');
+      vscode.window.showInformationMessage = async () => undefined;
+      vscode.window.showErrorMessage = async (msg: string) => {
+        assert.fail(`Unexpected error message: ${msg}`);
+      };
+
+      const mockBridge: any = {
+        createBox: async (args: any) => {
+          createdBoxArgs.push(args);
+          return {
+            boxId: 'box_rc_1',
+            name: args.name,
+            status: 'running',
+            image: 'docker.io/library/rileycarney/rc-typing-app:latest'
+          };
+        },
+        inspectBox: async () => ({
+          id: 'box_rc_1',
+          image: 'docker.io/library/rileycarney/rc-typing-app:latest'
+        }),
+        listImages: async () => ({
+          images: [{ name: 'docker.io/library/rileycarney/rc-typing-app' }]
+        }),
+        inspectImage: async () => ({
+          name: 'docker.io/library/rileycarney/rc-typing-app',
+          versions: [],
+          aliases: [],
+          history: []
+        })
+      };
+
+      await runUseYourOwnImageFlow({
+        bridge: mockBridge,
+        credentials: { getApiKey: async () => 'bl_live_test' } as any,
+        treeProvider: { refresh: () => {} } as any
+      });
+
+      assert.strictEqual(createdBoxArgs.length, 1);
+      assert.strictEqual(createdBoxArgs[0].diskSizeGb, 10);
+    } finally {
+      vscode.workspace.getConfiguration = origGetConfiguration;
+      vscode.window.showInputBox = origShowInputBox;
+      vscode.window.showQuickPick = origShowQuickPick;
       vscode.window.showInformationMessage = origShowInformationMessage;
       vscode.window.showErrorMessage = origShowErrorMessage;
     }

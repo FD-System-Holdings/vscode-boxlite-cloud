@@ -60,6 +60,7 @@ import { formatErrorWithDiagnosis } from '../util/diagnosis';
 import {
   showBoxConfigurationWizard,
   BOX_TEMPLATES,
+  MAX_STANDARD_DISK_SIZE_GB,
   convertBoxConfigToCreateArgs,
   getDefaultBoxConfiguration,
   getQuickCreateBoxConfiguration,
@@ -1926,6 +1927,7 @@ export function registerCommands(
       const createArgs: CreateBoxArgs = {
         name: name.trim() || undefined,
         image,
+        diskSizeGb: getDefaultBoxConfiguration().diskSizeGb,
         network: { outbound: { mode: 'enabled' } },
         secrets: [stored],
         env: envVar.trim() ? { [envVar.trim()]: placeholder } : undefined
@@ -2093,7 +2095,7 @@ export function registerCommands(
               image: inspected.image || 'python:alpine',
               cpus: inspected.cpus,
               memoryMib: inspected.memoryMib ?? inspected.memory_mib,
-              diskSizeGb: inspected.diskSizeGb ?? inspected.disk_size_gb,
+              diskSizeGb: inspected.diskSizeGb ?? inspected.disk_size_gb ?? MAX_STANDARD_DISK_SIZE_GB,
               autoStop: inspected.autoStop ?? inspected.auto_stop,
               autoDelete: inspected.autoDelete ?? inspected.auto_delete,
               autoResume: inspected.autoResume ?? inspected.auto_resume,

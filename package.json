@@ -987,8 +987,10 @@
         },
         "boxlite.defaultDisk": {
           "type": "number",
-          "default": 20,
-          "description": "Default rootfs disk size in GB for created boxes"
+          "default": 10,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Default rootfs disk size in GB for created boxes (1-10 GB; standard BoxLite Cloud per-box limit is 10 GB)"
         },
         "boxlite.defaultInboundMode": {
           "type": "string",

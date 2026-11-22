@@ -123,6 +123,7 @@ Boxes are isolated microVM instances.
 - **Do NOT send `auto_remove`:** It is deprecated/client-side and rejected by the Cloud OpenAPI schema (`400 Bad Request`).
 - **`auto_stop`:** Must be `0` (disabled) or `>= 60` seconds. Values between `1` and `59` are clamped to `60` by `bridge.py`.
 - **`auto_delete`:** Omit or `0` for persistent boxes; positive seconds for automatic deletion.
+- **`disk_size_gb`:** Standard per-box rootfs disk limit is `10` GB (`1`–`10` GB). Use Managed Volumes (`/v1/volumes`) when workloads require extra persistent storage beyond the rootfs limit.
 - **`network.outbound.mode = "disabled"`:** Provisions **no guest NIC** (air-gapped). This is permanent for the lifetime of the box—outbound, inbound, and tunnels cannot be enabled later.
 - **Restoring from a checkpoint:** Send **only** `{ "checkpoint_id": "<id-or-name>" }` and optional `"name"`. Passing any other option (`image`, `cpus`, `network`, `volumes`, etc.) is rejected because restored boxes inherit all settings from the checkpoint.
 
@@ -144,7 +145,7 @@ $createBody = @{
     image        = "python"            # Built-in image: base, python, node, sandbaseai-hermes, or OCI ref
     cpus         = 2
     memory_mib   = 4096
-    disk_size_gb = 20
+    disk_size_gb = 10
     auto_stop    = 900                 # 0 (disabled) or >= 60 seconds
     auto_resume  = $true
     env          = @{

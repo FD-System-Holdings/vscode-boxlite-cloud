@@ -10,6 +10,7 @@ describe('Project Configuration & Defaults', () => {
     assert.strictEqual(DEFAULT_CONFIG.healthPath, '/healthz');
     assert.strictEqual(DEFAULT_CONFIG.image, 'python');
     assert.strictEqual(DEFAULT_CONFIG.access, 'public');
+    assert.strictEqual(DEFAULT_CONFIG.diskSizeGb, 10);
     assert.strictEqual(DEFAULT_CONFIG.network?.inbound, 'enabled');
     assert.strictEqual(DEFAULT_CONFIG.network?.outbound?.mode, 'enabled');
   });
@@ -49,5 +50,24 @@ describe('Project Configuration & Defaults', () => {
     assert.strictEqual(saved.name, 'test-app');
 
     fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('should default omitted diskSizeGb to 10 and preserve explicit custom diskSizeGb in boxlite.json', async () => {
+    const vscode = require('vscode');
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-disk-proj-test-'));
+    const configPath = path.join(tempDir, 'boxlite.json');
+    try {
+      fs.writeFileSync(configPath, JSON.stringify({ name: 'default-disk-app' }), 'utf-8');
+      const defaultFound = await ProjectManager.findProjectConfig(vscode.Uri.file(tempDir));
+      assert.ok(defaultFound);
+      assert.strictEqual(defaultFound!.config.diskSizeGb, 10);
+
+      fs.writeFileSync(configPath, JSON.stringify({ name: 'custom-disk-app', diskSizeGb: 30 }), 'utf-8');
+      const customFound = await ProjectManager.findProjectConfig(vscode.Uri.file(tempDir));
+      assert.ok(customFound);
+      assert.strictEqual(customFound!.config.diskSizeGb, 30);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

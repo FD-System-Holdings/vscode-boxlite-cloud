@@ -452,6 +452,7 @@ describe('Outbound Proxy Secrets Support (docs.boxlite.ai/cloud/secrets)', () =>
       const createCall = calls.find((c) => c.method === 'createBox');
       assert.ok(createCall);
       assert.strictEqual(createCall!.args.name, 'agent-openai');
+      assert.strictEqual(createCall!.args.diskSizeGb, 10);
       assert.strictEqual(createCall!.args.env.OPENAI_API_KEY, '<BOXLITE_SECRET:openai>');
       assert.strictEqual(createCall!.args.secrets[0].value, 'sk-secret-v1');
 

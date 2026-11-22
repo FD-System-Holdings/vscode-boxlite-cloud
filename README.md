@@ -17,7 +17,7 @@ This extension provides a unified developer experience for creating, deploying, 
   - Automatically preserves and updates `boxId` in `boxlite.json` for rapid updates.
 - **Advanced Box Creation Configuration Wizard:** Comprehensive list of options for customizing every aspect of a new Box:
   - **Base Images:** Quick selection of official Cloud image aliases (`python`, `node`, `ubuntu`, `debian`, `alpine`) or custom OCI container tags.
-  - **Compute & Memory Sizing:** Choose preset tiers (Small: 1 vCPU / 2GB RAM / 10GB Disk, Medium: 2 vCPU / 4GB RAM / 20GB Disk, Large: 4 vCPU / 8GB RAM / 40GB Disk) or custom vCPU/RAM/Disk quotas.
+  - **Compute & Memory Sizing:** Choose preset tiers (Small: 1 vCPU / 2GB RAM / 10GB Disk, Medium: 2 vCPU / 4GB RAM / 10GB Disk, Large: 4 vCPU / 8GB RAM / 10GB Disk) or custom vCPU/RAM/Disk quotas.
   - **Network Policies:** Inbound proxy access toggle and outbound egress policies (Unrestricted `allow_net=[]`, Restricted Allowlist with strict host/CIDR validation, or Air-Gapped / Disabled without NIC).
   - **Lifecycle Management:** Idle auto-stop intervals (0s disabled, 5m, 15m, 30m, 1h, custom) and auto-delete lifecycle duration (0s persistent, 1d, 7d, custom).
   - **Auto-Resume:** Automatic request wake-up upon incoming HTTP proxy requests.
@@ -103,7 +103,7 @@ When creating a Box via `BoxLite: Create Box with Options...` (or by choosing **
 |---|---|---|
 | **Box Name** | Custom string (e.g. `box-a1b2c3`) | Unique instance identifier |
 | **Base Image** | `python`, `node`, `ubuntu`, `debian`, `alpine`, or custom tag | OCI / Cloud image alias |
-| **Compute Sizing** | Small (1 vCPU, 2GB RAM, 10GB Disk)<br>Medium (2 vCPU, 4GB RAM, 20GB Disk)<br>Large (4 vCPU, 8GB RAM, 40GB Disk)<br>Custom | Resource quota allocation |
+| **Compute Sizing** | Small (1 vCPU, 2GB RAM, 10GB Disk)<br>Medium (2 vCPU, 4GB RAM, 10GB Disk)<br>Large (4 vCPU, 8GB RAM, 10GB Disk)<br>Custom | Resource quota allocation |
 | **Inbound Access** | `enabled` / `disabled` | Allows Cloud proxy tunnels & public/private URLs (§2) |
 | **Outbound Policy** | `enabled` (Unrestricted `allow_net=[]`)<br>`enabled` (Restricted allowlist: hostnames / CIDR)<br>`disabled` (Air-gapped: no guest NIC provisioned) | Egress internet policy (§3) |
 | **Auto-Stop Interval** | `0` (Disabled)<br>`300s` (5m), `900s` (15m), `1800s` (30m), `3600s` (1h), Custom | MicroVM idle shutdown timer (§1) |

@@ -96,4 +96,13 @@ describe('Error Diagnostics (§5 Table Mapping)', () => {
     const diag = diagnoseError(msg);
     assert.strictEqual(diag.summary, 'Image Catalog Limit Reached (20 images)');
   });
+
+  it('should diagnose per-box resource limit errors without misattributing to auto_remove', () => {
+    const msg =
+      'BoxLite Cloud API error (400): Requested resources exceed per-box limits: disk 20GB exceeds the per-box limit of 10GB';
+    const diag = diagnoseError(msg);
+    assert.strictEqual(diag.summary, 'Requested Resources Exceed Per-Box Limits');
+    assert.strictEqual(diag.checklist.some((item) => item.includes('10 GB')), true);
+    assert.strictEqual(diag.checklist.some((item) => item.includes('auto_remove')), false);
+  });
 });

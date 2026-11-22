@@ -62,7 +62,7 @@ export const DEFAULT_CONFIG: BoxliteProjectConfig = {
   autoResume: true,
   cpus: 2,
   memoryMib: 4096,
-  diskSizeGb: 20
+  diskSizeGb: 10
 };
 
 export function buildSupervisorEntrypoint(startCmd: string = 'python3 -u server.py'): string[] {
@@ -93,6 +93,10 @@ export class ProjectManager {
       const merged: BoxliteProjectConfig = {
         ...DEFAULT_CONFIG,
         ...parsed,
+        diskSizeGb:
+          typeof parsed.diskSizeGb === 'number' && Number.isFinite(parsed.diskSizeGb)
+            ? parsed.diskSizeGb
+            : DEFAULT_CONFIG.diskSizeGb,
         volumes: parsed.volumes || DEFAULT_CONFIG.volumes || [],
         secrets: Array.isArray(parsed.secrets)
           ? parsed.secrets.map((s: any) => ({

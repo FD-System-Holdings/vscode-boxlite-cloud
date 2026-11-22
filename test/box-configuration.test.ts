@@ -11,6 +11,7 @@ import {
   BOX_TEMPLATES,
   SIZING_PRESETS,
   STANDARD_IMAGES,
+  MAX_STANDARD_DISK_SIZE_GB,
   saveConfigToProject,
   BoxConfiguration
 } from '../src/commands/boxConfiguration';
@@ -23,7 +24,7 @@ describe('Box Creation Configuration Options & Templates', () => {
     assert.strictEqual(config.sizingPreset, 'medium');
     assert.strictEqual(config.cpus, 2);
     assert.strictEqual(config.memoryMib, 4096);
-    assert.strictEqual(config.diskSizeGb, 20);
+    assert.strictEqual(config.diskSizeGb, 10);
     assert.strictEqual(config.inboundMode, 'enabled');
     assert.strictEqual(config.outboundMode, 'enabled');
     assert.deepStrictEqual(config.allowNet, []);
@@ -60,18 +61,43 @@ describe('Box Creation Configuration Options & Templates', () => {
     assert.strictEqual(args.autoStop, 300);
   });
 
-  it('should define valid compute sizing presets', () => {
+  it('should define valid compute sizing presets with <= 10 GB disk limit', () => {
+    assert.strictEqual(MAX_STANDARD_DISK_SIZE_GB, 10);
+
     assert.strictEqual(SIZING_PRESETS.small.cpus, 1);
     assert.strictEqual(SIZING_PRESETS.small.memoryMib, 2048);
     assert.strictEqual(SIZING_PRESETS.small.diskSizeGb, 10);
+    assert.ok(SIZING_PRESETS.small.description.includes('10 GB Disk'));
 
     assert.strictEqual(SIZING_PRESETS.medium.cpus, 2);
     assert.strictEqual(SIZING_PRESETS.medium.memoryMib, 4096);
-    assert.strictEqual(SIZING_PRESETS.medium.diskSizeGb, 20);
+    assert.strictEqual(SIZING_PRESETS.medium.diskSizeGb, 10);
+    assert.ok(SIZING_PRESETS.medium.description.includes('10 GB Disk'));
 
     assert.strictEqual(SIZING_PRESETS.large.cpus, 4);
     assert.strictEqual(SIZING_PRESETS.large.memoryMib, 8192);
-    assert.strictEqual(SIZING_PRESETS.large.diskSizeGb, 40);
+    assert.strictEqual(SIZING_PRESETS.large.diskSizeGb, 10);
+    assert.ok(SIZING_PRESETS.large.description.includes('10 GB Disk'));
+  });
+
+  it('should clamp stale boxlite.defaultDisk settings > 10 GB and preserve values <= 10 GB', () => {
+    const vscode = require('vscode');
+    const origGetConfiguration = vscode.workspace.getConfiguration;
+    try {
+      vscode.workspace.getConfiguration = () => ({
+        get: (key: string, def: any) => (key === 'defaultDisk' ? 20 : def),
+        update: async () => {}
+      });
+      assert.strictEqual(getDefaultBoxConfiguration().diskSizeGb, 10);
+
+      vscode.workspace.getConfiguration = () => ({
+        get: (key: string, def: any) => (key === 'defaultDisk' ? 6 : def),
+        update: async () => {}
+      });
+      assert.strictEqual(getDefaultBoxConfiguration().diskSizeGb, 6);
+    } finally {
+      vscode.workspace.getConfiguration = origGetConfiguration;
+    }
   });
 
   it('should include standard images matching Cloud image aliases', () => {
@@ -107,6 +133,14 @@ describe('Box Creation Configuration Options & Templates', () => {
     assert.strictEqual(airgappedTmpl.config.inboundMode, 'disabled');
     assert.strictEqual(airgappedTmpl.config.outboundMode, 'disabled');
     assert.strictEqual(airgappedTmpl.config.entrypointPreset, 'keepalive');
+
+    for (const tmpl of BOX_TEMPLATES) {
+      assert.strictEqual(
+        tmpl.config.diskSizeGb,
+        10,
+        `Template "${tmpl.id}" must set diskSizeGb to 10`
+      );
+    }
   });
 
   it('should resolve entrypoint correctly for all presets', () => {
@@ -139,11 +173,11 @@ describe('Box Creation Configuration Options & Templates', () => {
     assert.deepStrictEqual(customEp, ['my-bin', '--flag']);
   });
 
-  it('should convert BoxConfiguration to CreateBoxArgs accurately', () => {
+  it('should convert BoxConfiguration to CreateBoxArgs accurately, preserving custom diskSizeGb and clamping non-custom presets to <= 10 GB', () => {
     const config: BoxConfiguration = {
       name: 'test-custom-box',
       image: 'node',
-      sizingPreset: 'large',
+      sizingPreset: 'custom',
       cpus: 4,
       memoryMib: 8192,
       diskSizeGb: 40,
@@ -174,6 +208,20 @@ describe('Box Creation Configuration Options & Templates', () => {
     assert.strictEqual(args.network?.outbound?.mode, 'enabled');
     assert.deepStrictEqual(args.network?.outbound?.allow_net, ['api.example.com', '*.boxlite.ai']);
     assert.ok(Array.isArray(args.entrypoint));
+
+    const clampedArgs = convertBoxConfigToCreateArgs({
+      ...config,
+      sizingPreset: 'large',
+      diskSizeGb: 40
+    });
+    assert.strictEqual(clampedArgs.diskSizeGb, 10);
+
+    const smallerArgs = convertBoxConfigToCreateArgs({
+      ...config,
+      sizingPreset: 'small',
+      diskSizeGb: 5
+    });
+    assert.strictEqual(smallerArgs.diskSizeGb, 5);
   });
 
   it('should clear allow_net when outbound mode is disabled', () => {
@@ -200,7 +248,7 @@ describe('Box Creation Configuration Options & Templates', () => {
       image: 'python',
       cpus: 2,
       memoryMib: 4096,
-      diskSizeGb: 20,
+      diskSizeGb: 10,
       autoStop: 1800,
       autoDelete: 86400,
       defaultPort: 8080,
@@ -218,6 +266,7 @@ describe('Box Creation Configuration Options & Templates', () => {
     assert.strictEqual(content.image, 'python');
     assert.strictEqual(content.cpus, 2);
     assert.strictEqual(content.memoryMib, 4096);
+    assert.strictEqual(content.diskSizeGb, 10);
     assert.strictEqual(content.autoStop, 1800);
     assert.strictEqual(content.autoDelete, 86400);
     assert.strictEqual(content.port, 8080);
@@ -259,6 +308,7 @@ describe('Box Creation Configuration Options & Templates', () => {
       assert.strictEqual(result.image, 'node');
       assert.strictEqual(result.cpus, 4);
       assert.strictEqual(result.memoryMib, 8192);
+      assert.strictEqual(result.diskSizeGb, 10);
       assert.strictEqual(result.network?.inbound?.mode, 'enabled');
       assert.strictEqual(result.network?.outbound?.mode, 'enabled');
     } finally {
@@ -291,6 +341,54 @@ describe('Box Creation Configuration Options & Templates', () => {
     }
   });
 
+  it('should use 10 GB disk for large preset and allow explicit custom disk size in wizard', async () => {
+    const vscode = require('vscode');
+    const origQuickPick = vscode.window.showQuickPick;
+    const origInputBox = vscode.window.showInputBox;
+    try {
+      // 1. Selecting Large preset keeps diskSizeGb at 10
+      let step = 0;
+      vscode.window.showQuickPick = async (items: any[]) => {
+        step++;
+        if (step === 1) {
+          return items.find((i: any) => i.action === 'sizing');
+        }
+        if (step === 2) {
+          return items.find((i: any) => i.preset === 'large');
+        }
+        return items.find((i: any) => i.action === 'create');
+      };
+
+      const largeResult = await showBoxConfigurationWizard();
+      assert.ok(largeResult);
+      assert.strictEqual(largeResult.cpus, 4);
+      assert.strictEqual(largeResult.memoryMib, 8192);
+      assert.strictEqual(largeResult.diskSizeGb, 10);
+
+      // 2. Selecting Custom sizing allows user-specified disk size (e.g. 25 GB)
+      step = 0;
+      const customInputs = ['2', '4096', '25'];
+      vscode.window.showQuickPick = async (items: any[]) => {
+        step++;
+        if (step === 1) {
+          return items.find((i: any) => i.action === 'sizing');
+        }
+        if (step === 2) {
+          return items.find((i: any) => i.preset === 'custom');
+        }
+        return items.find((i: any) => i.action === 'create');
+      };
+      vscode.window.showInputBox = async () => customInputs.shift();
+
+      const customResult = await showBoxConfigurationWizard();
+      assert.ok(customResult);
+      assert.strictEqual(customResult.diskSizeGb, 25);
+    } finally {
+      vscode.window.showQuickPick = origQuickPick;
+      vscode.window.showInputBox = origInputBox;
+    }
+  });
+
   it('should contribute boxlite.createBoxWithOptions and configuration options in package.json', () => {
     const pkgPath = path.resolve(__dirname, '..', '..', 'package.json');
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
@@ -305,6 +403,9 @@ describe('Box Creation Configuration Options & Templates', () => {
     assert.ok(props['boxlite.defaultCpu'], 'boxlite.defaultCpu must be contributed');
     assert.ok(props['boxlite.defaultMemory'], 'boxlite.defaultMemory must be contributed');
     assert.ok(props['boxlite.defaultDisk'], 'boxlite.defaultDisk must be contributed');
+    assert.strictEqual(props['boxlite.defaultDisk'].default, 10);
+    assert.strictEqual(props['boxlite.defaultDisk'].minimum, 1);
+    assert.strictEqual(props['boxlite.defaultDisk'].maximum, 10);
     assert.ok(props['boxlite.defaultInboundMode'], 'boxlite.defaultInboundMode must be contributed');
     assert.ok(props['boxlite.defaultOutboundMode'], 'boxlite.defaultOutboundMode must be contributed');
     assert.ok(props['boxlite.defaultAutoDelete'], 'boxlite.defaultAutoDelete must be contributed');

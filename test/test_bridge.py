@@ -169,7 +169,7 @@ class TestBoxLiteBridge(unittest.IsolatedAsyncioTestCase):
             auto_resume=False,
             cpus=2,
             memory_mib=2048,
-            disk_size_gb=20,
+            disk_size_gb=10,
             env={"PORT": "3000"},
             cmd=["node", "server.js"],
             entrypoint=None,
@@ -181,9 +181,27 @@ class TestBoxLiteBridge(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("auto_remove", kwargs)
         self.assertEqual(kwargs["cpus"], 2)
         self.assertEqual(kwargs["memory_mib"], 2048)
-        self.assertEqual(kwargs["disk_size_gb"], 20)
+        self.assertEqual(kwargs["disk_size_gb"], 10)
         self.assertEqual(kwargs["auto_delete"], 3600)
         self.assertEqual(kwargs["auto_resume"], False)
+
+        custom_kwargs = br._build_rest_create_kwargs(
+            image="node:20-alpine",
+            name="my-custom-app",
+            auto_stop=0,
+            auto_delete=0,
+            auto_resume=True,
+            cpus=4,
+            memory_mib=4096,
+            disk_size_gb=25,
+            env=None,
+            cmd=None,
+            entrypoint=None,
+            network_spec=None,
+            volumes=None,
+            secrets_payload=None,
+        )
+        self.assertEqual(custom_kwargs["disk_size_gb"], 25)
 
     def test_rest_fallback_reuses_existing_rest_runtime(self):
         br = bridge.BoxLiteBridge()
@@ -303,6 +321,25 @@ class TestBoxLiteBridge(unittest.IsolatedAsyncioTestCase):
         diag = captured[0][2]["diagnosis"]
         self.assertIn("Image pull failed", diag)
         self.assertNotIn("401 Unauthorized", diag)
+
+    async def test_dispatch_diagnoses_per_box_resource_limit_without_auto_remove_misattribution(self):
+        br = bridge.BoxLiteBridge()
+
+        async def fail_create(_args):
+            raise RuntimeError(
+                "BoxLite Cloud API error (400): Requested resources exceed per-box limits: disk 20GB exceeds the per-box limit of 10GB"
+            )
+
+        br.handle_create_box = fail_create
+        captured = []
+        with patch.object(bridge, "send_response", side_effect=lambda req_id, ok, data=None, error=None: captured.append((req_id, ok, error))):
+            await br.dispatch({"id": "req_2", "op": "create_box", "args": {}})
+
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(captured[0][1])
+        diag = captured[0][2]["diagnosis"]
+        self.assertIn("Requested resources exceed per-box limits", diag)
+        self.assertNotIn("auto_remove", diag)
 
 
 if __name__ == "__main__":

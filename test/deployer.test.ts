@@ -241,11 +241,15 @@ describe('BoxLiteDeployer', () => {
         })
       );
 
+      let capturedCreateArgs: CreateBoxArgs | undefined;
       let inboundUpdated: string | undefined;
       let tunnelCalled = false;
 
       const mockBridge = {
-        createBox: async () => ({ boxId: 'box-priv-1', name: 'private-worker', status: 'running' }),
+        createBox: async (args: CreateBoxArgs) => {
+          capturedCreateArgs = args;
+          return { boxId: 'box-priv-1', name: 'private-worker', status: 'running' };
+        },
         exec: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
         copyIn: async () => ({ copied: true }),
         updateInbound: async (_boxId: string, mode: string) => {
@@ -271,6 +275,8 @@ describe('BoxLiteDeployer', () => {
 
       await deployer.deployWorkspace();
 
+      assert.ok(capturedCreateArgs);
+      assert.strictEqual(capturedCreateArgs!.diskSizeGb, 10);
       assert.strictEqual(inboundUpdated, 'disabled');
       assert.strictEqual(tunnelCalled, false, 'Tunnel must not be created when network.inbound is disabled');
     });

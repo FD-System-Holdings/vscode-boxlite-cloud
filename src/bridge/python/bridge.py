@@ -1901,6 +1901,7 @@ class BoxLiteBridge:
         try:
             created = await self.handle_create_box({
                 "image": image,
+                "diskSizeGb": 10,
                 "autoStop": 0,
                 "autoDelete": 0,
                 "secrets": [{
@@ -2197,6 +2198,16 @@ class BoxLiteBridge:
                 diagnosis = "403 Forbidden: Check authentication/token and requested URL; do not assume either app health or one particular policy cause (agent.md §5). Note: do not infer managed database or shared-volume support (agent.md §4). For private images or registries, ensure API key has Full access (docs.boxlite.ai/cloud/private-images)."
             elif "409" in message or "already ran" in message.lower() or "conflict" in message.lower():
                 diagnosis = "409 Conflict: Process already ran or name conflict. Check supervisor entrypoint and box lifecycle (agent.md §5)."
+            elif (
+                "exceed per-box limit" in lower_msg
+                or "exceeds the per-box limit" in lower_msg
+                or "requested resources exceed" in lower_msg
+            ):
+                diagnosis = (
+                    "Requested resources exceed per-box limits: BoxLite Cloud enforces per-box resource limits "
+                    "(standard rootfs disk limit is 10 GB). Set disk size to 10 GB or less (or lower CPU/memory) "
+                    "in Box options, boxlite.json, or boxlite.defaultDisk, or attach a Managed Volume for extra storage."
+                )
             elif "400" in message or "bad request" in message.lower():
                 diagnosis = "400 Bad Request: Check schema validation and parameters; ensure deprecated or unsupported fields (such as auto_remove) are omitted (agent.md §5)."
             elif "NetworkError" in error_class or "network" in message.lower():

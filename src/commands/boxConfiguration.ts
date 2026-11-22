@@ -49,6 +49,15 @@ export interface BoxTemplate {
   config: Partial<BoxConfiguration>;
 }
 
+export const MAX_STANDARD_DISK_SIZE_GB = 10;
+
+export function clampStandardDiskSizeGb(diskSizeGb: number | undefined): number {
+  if (typeof diskSizeGb !== 'number' || !Number.isFinite(diskSizeGb) || diskSizeGb < 1) {
+    return MAX_STANDARD_DISK_SIZE_GB;
+  }
+  return Math.min(Math.floor(diskSizeGb), MAX_STANDARD_DISK_SIZE_GB);
+}
+
 export const SIZING_PRESETS: Record<
   Exclude<SizingPreset, 'custom'>,
   { label: string; description: string; cpus: number; memoryMib: number; diskSizeGb: number }
@@ -62,17 +71,17 @@ export const SIZING_PRESETS: Record<
   },
   medium: {
     label: 'Medium (Recommended)',
-    description: '2 vCPU · 4096 MiB RAM · 20 GB Disk (Standard web services & apps)',
+    description: '2 vCPU · 4096 MiB RAM · 10 GB Disk (Standard web services & apps)',
     cpus: 2,
     memoryMib: 4096,
-    diskSizeGb: 20
+    diskSizeGb: 10
   },
   large: {
     label: 'Large',
-    description: '4 vCPU · 8192 MiB RAM · 40 GB Disk (Data processing & build tasks)',
+    description: '4 vCPU · 8192 MiB RAM · 10 GB Disk (Data processing & build tasks)',
     cpus: 4,
     memoryMib: 8192,
-    diskSizeGb: 40
+    diskSizeGb: 10
   }
 };
 
@@ -109,13 +118,13 @@ export const BOX_TEMPLATES: BoxTemplate[] = [
     id: 'python-app',
     label: '$(symbol-event) Python Web Application (agent.md §1)',
     description: 'Standard Python web service with background supervisor',
-    detail: 'image: python · 2 vCPU · 4 GB RAM · Inbound enabled · Unrestricted outbound · Auto-stop disabled · Port 8080',
+    detail: 'image: python · 2 vCPU · 4 GB RAM · 10 GB Disk · Inbound enabled · Unrestricted outbound · Auto-stop disabled · Port 8080',
     config: {
       image: 'python',
       sizingPreset: 'medium',
       cpus: 2,
       memoryMib: 4096,
-      diskSizeGb: 20,
+      diskSizeGb: 10,
       inboundMode: 'enabled',
       outboundMode: 'enabled',
       allowNet: [],
@@ -131,13 +140,13 @@ export const BOX_TEMPLATES: BoxTemplate[] = [
     id: 'node-app',
     label: '$(server-process) Node.js Web Application',
     description: 'Node.js server with automatic supervisor restart',
-    detail: 'image: node · 2 vCPU · 4 GB RAM · Inbound enabled · Unrestricted outbound · Auto-stop disabled · Port 3000',
+    detail: 'image: node · 2 vCPU · 4 GB RAM · 10 GB Disk · Inbound enabled · Unrestricted outbound · Auto-stop disabled · Port 3000',
     config: {
       image: 'node',
       sizingPreset: 'medium',
       cpus: 2,
       memoryMib: 4096,
-      diskSizeGb: 20,
+      diskSizeGb: 10,
       inboundMode: 'enabled',
       outboundMode: 'enabled',
       allowNet: [],
@@ -153,13 +162,13 @@ export const BOX_TEMPLATES: BoxTemplate[] = [
     id: 'secure-egress',
     label: '$(shield) Secure / Egress-Restricted Box (agent.md §3)',
     description: 'Inbound web service with restricted outbound network allowlist',
-    detail: 'image: python · 2 vCPU · 4 GB RAM · Inbound enabled · Filtered egress domain rules · 15m idle auto-stop',
+    detail: 'image: python · 2 vCPU · 4 GB RAM · 10 GB Disk · Inbound enabled · Filtered egress domain rules · 15m idle auto-stop',
     config: {
       image: 'python',
       sizingPreset: 'medium',
       cpus: 2,
       memoryMib: 4096,
-      diskSizeGb: 20,
+      diskSizeGb: 10,
       inboundMode: 'enabled',
       outboundMode: 'enabled',
       allowNet: ['pypi.org', 'files.pythonhosted.org'],
@@ -175,7 +184,7 @@ export const BOX_TEMPLATES: BoxTemplate[] = [
     id: 'airgapped-sandbox',
     label: '$(lock) Air-Gapped Isolated Sandbox (agent.md §3)',
     description: 'Completely isolated microVM with no guest NIC provisioned',
-    detail: 'image: python · 1 vCPU · 2 GB RAM · Inbound disabled · Outbound disabled · Shell keepalive · 5m idle stop',
+    detail: 'image: python · 1 vCPU · 2 GB RAM · 10 GB Disk · Inbound disabled · Outbound disabled · Shell keepalive · 5m idle stop',
     config: {
       image: 'python',
       sizingPreset: 'small',
@@ -196,13 +205,13 @@ export const BOX_TEMPLATES: BoxTemplate[] = [
     id: 'ubuntu-utility',
     label: '$(terminal) Ubuntu Linux Interactive Utility',
     description: 'General purpose Ubuntu container with keepalive entrypoint',
-    detail: 'image: ubuntu · 2 vCPU · 4 GB RAM · Outbound enabled · Inbound enabled · 30m idle stop',
+    detail: 'image: ubuntu · 2 vCPU · 4 GB RAM · 10 GB Disk · Outbound enabled · Inbound enabled · 30m idle stop',
     config: {
       image: 'ubuntu',
       sizingPreset: 'medium',
       cpus: 2,
       memoryMib: 4096,
-      diskSizeGb: 20,
+      diskSizeGb: 10,
       inboundMode: 'enabled',
       outboundMode: 'enabled',
       allowNet: [],
@@ -217,13 +226,13 @@ export const BOX_TEMPLATES: BoxTemplate[] = [
     id: 'llm-secret-box',
     label: '$(shield) LLM / API Agent with Secret Proxy Injection (docs.boxlite.ai/cloud/secrets)',
     description: 'Calls OpenAI/HTTPS APIs with <BOXLITE_SECRET:model> placeholder injection',
-    detail: 'image: python · 2 vCPU · 4 GB RAM · Restricted/Outbound enabled · Proxy Secret placeholder env',
+    detail: 'image: python · 2 vCPU · 4 GB RAM · 10 GB Disk · Restricted/Outbound enabled · Proxy Secret placeholder env',
     config: {
       image: 'python',
       sizingPreset: 'medium',
       cpus: 2,
       memoryMib: 4096,
-      diskSizeGb: 20,
+      diskSizeGb: 10,
       inboundMode: 'disabled',
       outboundMode: 'enabled',
       allowNet: ['api.openai.com'],
@@ -251,7 +260,9 @@ export function getDefaultBoxConfiguration(): BoxConfiguration {
   const defaultAutoResume = vsConfig.get<boolean>('defaultAutoResume', true);
   const defaultCpu = vsConfig.get<number>('defaultCpu', 2);
   const defaultMemory = vsConfig.get<number>('defaultMemory', 4096);
-  const defaultDisk = vsConfig.get<number>('defaultDisk', 20);
+  const defaultDisk = clampStandardDiskSizeGb(
+    vsConfig.get<number>('defaultDisk', MAX_STANDARD_DISK_SIZE_GB)
+  );
   const defaultInbound = vsConfig.get<'enabled' | 'disabled'>('defaultInboundMode', 'enabled');
   const defaultOutbound = vsConfig.get<'enabled' | 'disabled'>('defaultOutboundMode', 'enabled');
 
@@ -309,6 +320,16 @@ export function resolveEntrypoint(config: BoxConfiguration): string[] | undefine
   }
 }
 
+function resolveDiskSizeForConfig(config: BoxConfiguration): number {
+  if (config.sizingPreset === 'custom') {
+    return Math.max(
+      1,
+      Math.floor(Number.isFinite(config.diskSizeGb) ? config.diskSizeGb : MAX_STANDARD_DISK_SIZE_GB)
+    );
+  }
+  return clampStandardDiskSizeGb(config.diskSizeGb);
+}
+
 export function convertBoxConfigToCreateArgs(config: BoxConfiguration): CreateBoxArgs {
   const entrypoint = resolveEntrypoint(config);
 
@@ -321,7 +342,7 @@ export function convertBoxConfigToCreateArgs(config: BoxConfiguration): CreateBo
     autoResume: config.autoResume,
     cpus: config.cpus,
     memoryMib: config.memoryMib,
-    diskSizeGb: config.diskSizeGb,
+    diskSizeGb: resolveDiskSizeForConfig(config),
     entrypoint,
     env: Object.keys(config.env).length > 0 ? config.env : undefined,
     network: {
@@ -348,6 +369,9 @@ export async function showBoxConfigurationWizard(
     ...getDefaultBoxConfiguration(),
     ...(initialConfig || {})
   };
+  if (current.sizingPreset !== 'custom') {
+    current.diskSizeGb = clampStandardDiskSizeGb(current.diskSizeGb);
+  }
 
   while (true) {
     const sizingLabel =
@@ -704,11 +728,12 @@ async function promptForSizing(current: BoxConfiguration) {
     }
 
     const diskStr = await vscode.window.showInputBox({
-      prompt: 'Disk size in GB (e.g. 10, 20, 40)',
+      prompt: 'Disk size in GB (standard per-box limit: 10 GB; specify another size only for custom quotas)',
       value: `${current.diskSizeGb}`,
       validateInput: (v) => {
-        const n = parseInt(v, 10);
-        return isNaN(n) || n < 1 ? 'Enter a valid disk size in GB (>= 1)' : null;
+        const trimmed = v.trim();
+        const n = parseInt(trimmed, 10);
+        return !/^\d+$/.test(trimmed) || isNaN(n) || n < 1 ? 'Enter a valid disk size in GB (>= 1)' : null;
       }
     });
     if (!diskStr) {
@@ -718,7 +743,7 @@ async function promptForSizing(current: BoxConfiguration) {
     current.sizingPreset = 'custom';
     current.cpus = parseInt(cpusStr, 10);
     current.memoryMib = parseInt(memStr, 10);
-    current.diskSizeGb = parseInt(diskStr, 10);
+    current.diskSizeGb = parseInt(diskStr.trim(), 10);
   } else {
     const p = SIZING_PRESETS[pick.preset];
     current.sizingPreset = pick.preset;
@@ -1344,7 +1369,7 @@ export async function saveConfigToProject(
     autoResume: config.autoResume,
     cpus: config.cpus,
     memoryMib: config.memoryMib,
-    diskSizeGb: config.diskSizeGb,
+    diskSizeGb: resolveDiskSizeForConfig(config),
     volumes: config.volumes || existing.volumes || [],
     secrets:
       config.secrets && config.secrets.length > 0

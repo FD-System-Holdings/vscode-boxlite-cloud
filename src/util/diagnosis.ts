@@ -159,6 +159,21 @@ export function diagnoseError(errorMessage: string, code?: string): DiagnosticMe
     };
   }
 
+  if (
+    lower.includes('exceed per-box limit') ||
+    lower.includes('exceeds the per-box limit') ||
+    lower.includes('requested resources exceed')
+  ) {
+    return {
+      summary: 'Requested Resources Exceed Per-Box Limits',
+      checklist: [
+        'BoxLite Cloud enforces per-box resource limits (standard rootfs disk limit is 10 GB)',
+        'Lower the requested disk size to 10 GB or less (or reduce CPU / memory) in Box options, boxlite.json, or the boxlite.defaultDisk setting',
+        'Use a Managed Volume from the Volumes view if your workload needs persistent storage beyond the rootfs limit'
+      ]
+    };
+  }
+
   if (lower.includes('400') || lower.includes('bad request') || lower.includes('should not exist')) {
     return {
       summary: '400 Bad Request / Schema Validation Error',
