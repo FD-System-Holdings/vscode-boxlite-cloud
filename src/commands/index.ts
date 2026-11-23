@@ -30,7 +30,7 @@ import {
   LaunchBoxFromOwnImageResult,
   runUseYourOwnImageFlow
 } from '../images/customImageWorkflow';
-import { BoxLiteDeployer } from '../deploy/deployer';
+import { BoxLiteDeployer, buildRestartCommand } from '../deploy/deployer';
 import { scaffoldNewProject } from '../deploy/scaffold';
 import { ProjectManager, DEFAULT_CONFIG } from '../deploy/project';
 import { LogStreamManager } from '../logs/logStream';
@@ -66,6 +66,24 @@ import {
   getQuickCreateBoxConfiguration,
   generateBoxName
 } from './boxConfiguration';
+
+function isSafeExternalHttpUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+async function openExternalHttpUrl(rawUrl: string): Promise<boolean> {
+  if (!isSafeExternalHttpUrl(rawUrl)) {
+    vscode.window.showErrorMessage(`Refusing to open unsafe URL: "${rawUrl}" (only http:// and https:// URLs are allowed).`);
+    return false;
+  }
+  await vscode.env.openExternal(vscode.Uri.parse(rawUrl));
+  return true;
+}
 
 function isNetworkDisabledError(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
@@ -525,11 +543,15 @@ export function registerCommands(
         { location: vscode.ProgressLocation.Notification, title: `Restarting application in Box...` },
         async () => {
           try {
-            // Kill any running python process; the supervisor will immediately restart it
-            await bridge.exec(boxId, 'pkill', ['-f', 'server.py']);
+            const projectInfo = await ProjectManager.findProjectConfig();
+            const startCmd = projectInfo?.config.start || 'python3 -u server.py';
+            const res = await bridge.exec(boxId, 'sh', ['-c', buildRestartCommand(startCmd)]);
+            if (res.exitCode !== 0) {
+              throw new Error(res.stderr || `Restart command exited with code ${res.exitCode}`);
+            }
             vscode.window.showInformationMessage(`Application restarted successfully.`);
-          } catch {
-            vscode.window.showInformationMessage(`Restart signal sent.`);
+          } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to restart application: ${formatErrorWithDiagnosis(e)}`);
           }
         }
       );
@@ -585,7 +607,7 @@ export function registerCommands(
       }
 
       if (url) {
-        vscode.env.openExternal(vscode.Uri.parse(url));
+        await openExternalHttpUrl(url);
       } else {
         vscode.window.showWarningMessage('No active tunnel URL found for this Box.');
       }

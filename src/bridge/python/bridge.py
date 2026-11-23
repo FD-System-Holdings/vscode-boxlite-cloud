@@ -9,6 +9,7 @@ Communicates with the VS Code extension host over standard I/O using JSON-lines.
 import asyncio
 import json
 import os
+import re
 import secrets as py_secrets
 import sys
 import traceback
@@ -196,11 +197,34 @@ class RestBoxFallback:
         return TunnelResultFallback(res)
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+_SAFE_VERIFY_HOST_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
+)
+
+
+def _assert_secure_rest_url(raw_url: str) -> str:
+    cleaned = (raw_url or "").strip().rstrip("/")
+    parsed = urllib.parse.urlparse(cleaned)
+    if parsed.scheme == "https":
+        if not parsed.netloc:
+            raise ValueError(f"Invalid REST URL: '{raw_url}'")
+        return cleaned
+    if parsed.scheme == "http":
+        host = (parsed.hostname or "").lower()
+        if host in _LOOPBACK_HOSTS:
+            return cleaned
+        raise ValueError(
+            f"Insecure http:// REST URL is only allowed for loopback hosts (127.0.0.1, localhost, ::1); use https:// instead ('{host}')."
+        )
+    raise ValueError(f"Unsupported REST URL scheme: '{parsed.scheme}'")
+
+
 class RestRuntimeFallback:
     """Pure-Python REST client for BoxLite Cloud when native boxlite package is not installed."""
 
     def __init__(self, rest_url: str, api_key: str):
-        self.rest_url = rest_url.rstrip("/")
+        self.rest_url = _assert_secure_rest_url(rest_url)
         self.api_key = api_key
 
     def _request(self, method: str, path: str, body: Any = None, timeout: int = 30) -> Any:
@@ -321,8 +345,11 @@ class RestRuntimeFallback:
 
     async def tunnel(self, box_id: str, port: int, is_public: bool) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
+        valid_port = int(port)
+        if valid_port < 1 or valid_port > 65535:
+            raise ValueError(f"Invalid tunnel port: {port}")
         encoded_id = urllib.parse.quote(str(box_id), safe="")
-        path = f"/boxes/{encoded_id}/network/tunnel?port={port}"
+        path = f"/boxes/{encoded_id}/network/tunnel?port={valid_port}"
         # OpenAPI schema requires camelCase 'isPublic' and additionalProperties: false
         body = {"isPublic": is_public} if not is_public else None
         res = await loop.run_in_executor(None, self._request, "POST", path, body)
@@ -330,8 +357,11 @@ class RestRuntimeFallback:
 
     async def revoke_tunnel(self, box_id: str, port: int) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
+        valid_port = int(port)
+        if valid_port < 1 or valid_port > 65535:
+            raise ValueError(f"Invalid tunnel port: {port}")
         encoded_id = urllib.parse.quote(str(box_id), safe="")
-        path = f"/boxes/{encoded_id}/network/tunnel?port={port}"
+        path = f"/boxes/{encoded_id}/network/tunnel?port={valid_port}"
         await loop.run_in_executor(None, self._request, "DELETE", path)
         return {"revoked": True}
 
@@ -360,7 +390,8 @@ class RestRuntimeFallback:
 
     async def get_volume(self, volume_id: str) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._request, "GET", f"/volumes/{volume_id}")
+        encoded_id = urllib.parse.quote(str(volume_id), safe="")
+        return await loop.run_in_executor(None, self._request, "GET", f"/volumes/{encoded_id}")
 
     async def create_volume(self, name: Optional[str] = None) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
@@ -369,7 +400,8 @@ class RestRuntimeFallback:
 
     async def remove_volume(self, volume_id: str, force: bool = False) -> None:
         loop = asyncio.get_running_loop()
-        path = f"/volumes/{volume_id}?force=true" if force else f"/volumes/{volume_id}"
+        encoded_id = urllib.parse.quote(str(volume_id), safe="")
+        path = f"/volumes/{encoded_id}?force=true" if force else f"/volumes/{encoded_id}"
         await loop.run_in_executor(None, self._request, "DELETE", path)
 
     async def list_images(self) -> Dict[str, Any]:
@@ -1350,7 +1382,7 @@ class BoxLiteBridge:
     async def handle_tail_log(self, args: Dict[str, Any]) -> Dict[str, Any]:
         box_id = args["boxId"]
         log_file = args.get("logFile", "/tmp/server.log")
-        lines = int(args.get("lines", 100))
+        lines = max(1, min(int(args.get("lines", 100)), 10000))
         rt = self.ensure_runtime()
         box = self.get_or_attach_box(box_id)
 
@@ -1983,7 +2015,9 @@ class BoxLiteBridge:
     async def handle_verify_secret_injection(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         image = args.get("image") or "python:alpine"
-        host = args.get("host") or "httpbingo.org"
+        host = (args.get("host") or "httpbingo.org").strip()
+        if not _SAFE_VERIFY_HOST_RE.match(host):
+            raise ValueError(f"Invalid verification hostname: '{host}'")
         token = "demo-not-a-real-key-" + py_secrets.token_hex(16)
         box_id = None
 
@@ -2011,9 +2045,10 @@ class BoxLiteBridge:
             if env_res.get("exitCode", 0) != 0 or not env_out.strip() or token in env_out:
                 raise RuntimeError("Guest environment check failed: test token appeared in guest environment or env failed.")
 
+            target_url_literal = json.dumps(f"https://{host}/headers")
             request_code = (
                 "import json, ssl, urllib.request\n"
-                f'req = urllib.request.Request("https://{host}/headers", headers={{"Authorization": "Bearer <BOXLITE_SECRET:demo>"}})\n'
+                f'req = urllib.request.Request({target_url_literal}, headers={{"Authorization": "Bearer <BOXLITE_SECRET:demo>"}})\n'
                 'ctx = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")\n'
                 "with urllib.request.urlopen(req, context=ctx, timeout=30) as response:\n"
                 "    print(response.read().decode())\n"

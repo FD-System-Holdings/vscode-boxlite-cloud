@@ -58,6 +58,7 @@ export class SshService implements vscode.Disposable {
   private activeTerminals = new Map<string, vscode.Terminal>();
   private disposables: vscode.Disposable[] = [];
   private cachedNodeBin: string | null | undefined;
+  private fallbackStorageRoot: string | undefined;
   public readonly restClient: BoxliteRestSshClient;
   public readonly forwarderManager: LocalForwarderManager;
   public readonly tunnelBroker: LocalTunnelBroker;
@@ -168,9 +169,15 @@ export class SshService implements vscode.Disposable {
     if (this.context.globalStorageUri?.fsPath) {
       return this.context.globalStorageUri.fsPath;
     }
-    const fallbackDir = path.join(os.tmpdir(), 'boxlite-cloud-ssh');
-    fs.mkdirSync(fallbackDir, { recursive: true, mode: 0o700 });
-    return fallbackDir;
+    if (!this.fallbackStorageRoot || !fs.existsSync(this.fallbackStorageRoot)) {
+      this.fallbackStorageRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-cloud-ssh-'));
+      if (process.platform !== 'win32') {
+        try {
+          fs.chmodSync(this.fallbackStorageRoot, 0o700);
+        } catch {}
+      }
+    }
+    return this.fallbackStorageRoot;
   }
 
   private getProxyScriptPath(): string {

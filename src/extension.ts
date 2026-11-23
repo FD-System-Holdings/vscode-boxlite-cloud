@@ -205,7 +205,15 @@ export async function activate(context: vscode.ExtensionContext) {
   const volumesProvider = new VolumesTreeDataProvider(bridge, credentials);
   const checkpointsProvider = new CheckpointsTreeDataProvider(bridge, credentials);
   const secretsProvider = new SecretsTreeDataProvider(bridge, credentials, secretsManager);
-  context.subscriptions.push(treeProvider, domainsProvider, volumesProvider, checkpointsProvider);
+  context.subscriptions.push(
+    accountProvider,
+    treeProvider,
+    domainsProvider,
+    imagesProvider,
+    volumesProvider,
+    checkpointsProvider,
+    secretsProvider
+  );
 
   const allProviders = [
     accountProvider,

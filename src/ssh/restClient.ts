@@ -55,6 +55,7 @@ const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 const CONNECT_REFUSAL_MAX_BYTES = 512;
 const CONNECT_REFUSAL_TIMEOUT_MS = 2_000;
 const MAX_CONNECT_HEADER_BYTES = 16_384;
+const MAX_HTTP_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
@@ -145,7 +146,15 @@ export class NodeRestHttpTransport implements RestHttpTransport {
         },
         (res) => {
           const chunks: Buffer[] = [];
-          res.on('data', (c: Buffer) => chunks.push(c));
+          let totalBytes = 0;
+          res.on('data', (c: Buffer) => {
+            totalBytes += c.length;
+            if (totalBytes > MAX_HTTP_RESPONSE_BYTES) {
+              req.destroy(new Error(`Response body exceeded ${MAX_HTTP_RESPONSE_BYTES} byte limit`));
+              return;
+            }
+            chunks.push(c);
+          });
           res.on('end', () => {
             resolve({
               statusCode: res.statusCode ?? 0,

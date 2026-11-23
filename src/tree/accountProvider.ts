@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { CredentialsManager } from '../auth/credentials';
 import { BoxLiteTreeItem, AccountTreeItem, ApiKeyTreeItem, LinkApiKeyActionTreeItem } from './nodes';
 
-export class AccountTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem> {
+export class AccountTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem>, vscode.Disposable {
   private _onDidChangeTreeData = new vscode.EventEmitter<BoxLiteTreeItem | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
   private startupReady = true;
@@ -15,6 +15,10 @@ export class AccountTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
 
   public refresh(): void {
     this._onDidChangeTreeData.fire();
+  }
+
+  public dispose(): void {
+    this._onDidChangeTreeData.dispose();
   }
 
   public getTreeItem(element: BoxLiteTreeItem): vscode.TreeItem {

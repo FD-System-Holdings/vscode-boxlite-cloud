@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 
 const SECRET_KEY_API_KEYS = 'boxlite.apiKeys';
@@ -171,7 +172,7 @@ export class CredentialsManager {
       throw new Error(`An API key with the name "${trimmedName}" already exists.`);
     }
 
-    const id = `key_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const id = `key_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
     data.keys.push({ id, name: trimmedName, key: trimmedKey });
     data.activeId = id;
     await this.save(data);

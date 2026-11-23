@@ -74,14 +74,29 @@ function relayStdio(remoteSocket: net.Socket): Promise<void> {
   });
 }
 
+const MAX_BROKER_HANDSHAKE_BYTES = 4096;
+
 async function connectViaBroker(brokerPath: string, boxId: string, port: number): Promise<net.Socket> {
   if (!fs.existsSync(brokerPath)) {
     throw new Error(
       `VS Code BoxLite SSH broker not found at "${brokerPath}". Reconnect from VS Code or set BOXLITE_API_KEY.`
     );
   }
-  const descriptor = JSON.parse(fs.readFileSync(brokerPath, 'utf-8')) as BrokerDescriptor;
-  const socket = net.connect({ host: '127.0.0.1', port: descriptor.port });
+  const descriptor = JSON.parse(fs.readFileSync(brokerPath, 'utf-8')) as Partial<BrokerDescriptor>;
+  const brokerPort = Number(descriptor?.port);
+  if (
+    !Number.isInteger(brokerPort) ||
+    brokerPort < 1 ||
+    brokerPort > 65535 ||
+    typeof descriptor?.secret !== 'string' ||
+    descriptor.secret.length === 0
+  ) {
+    throw new Error(
+      `Invalid BoxLite SSH broker descriptor at "${brokerPath}". Reconnect from VS Code or set BOXLITE_API_KEY.`
+    );
+  }
+  const brokerSecret = descriptor.secret;
+  const socket = net.connect({ host: '127.0.0.1', port: brokerPort });
 
   await new Promise<void>((resolve, reject) => {
     let buf = Buffer.alloc(0);
@@ -96,6 +111,19 @@ async function connectViaBroker(brokerPath: string, boxId: string, port: number)
     };
 
     const onData = (chunk: Buffer) => {
+      const nlInChunk = chunk.indexOf(0x0a);
+      if (
+        (nlInChunk === -1 && buf.length + chunk.length > MAX_BROKER_HANDSHAKE_BYTES) ||
+        (nlInChunk !== -1 && buf.length + nlInChunk > MAX_BROKER_HANDSHAKE_BYTES)
+      ) {
+        clearTimeout(timer);
+        socket.removeListener('data', onData);
+        socket.removeListener('error', onError);
+        socket.destroy();
+        reject(new Error('Broker handshake response exceeded maximum size.'));
+        return;
+      }
+
       buf = Buffer.concat([buf, chunk]);
       const nlIdx = buf.indexOf(0x0a);
       if (nlIdx === -1) {
@@ -121,7 +149,7 @@ async function connectViaBroker(brokerPath: string, boxId: string, port: number)
 
     socket.once('error', onError);
     socket.once('connect', () => {
-      socket.write(`${JSON.stringify({ secret: descriptor.secret, boxId, port })}\n`);
+      socket.write(`${JSON.stringify({ secret: brokerSecret, boxId, port })}\n`);
     });
     socket.on('data', onData);
   });

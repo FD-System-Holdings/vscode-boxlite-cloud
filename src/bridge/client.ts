@@ -35,6 +35,7 @@ import { CredentialsManager } from '../auth/credentials';
 import { PythonEnvManager } from './env';
 import { diagnoseError } from '../util/diagnosis';
 import { parseExecutableCommand, createCleanSubprocessEnv } from '../util/process';
+import { redactSensitiveText } from '../ssh/parse';
 
 export class BoxLiteBridgeClient implements vscode.Disposable {
   private process: ChildProcess | null = null;
@@ -192,7 +193,7 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
     if (proc.stderr) {
       this.stderrRl = readline.createInterface({ input: proc.stderr });
       this.stderrRl.on('line', (line) => {
-        this.safeLog(`[bridge:py] ${line}`);
+        this.safeLog(`[bridge:py] ${redactSensitiveText(line)}`);
       });
     }
 
@@ -252,7 +253,7 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
         }
       }
     } catch (e: any) {
-      this.safeLog(`[bridge] Unrecognized output: ${trimmed}`);
+      this.safeLog(`[bridge] Unrecognized output: ${redactSensitiveText(trimmed)}`);
     }
   }
 

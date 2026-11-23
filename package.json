@@ -960,11 +960,13 @@
       "properties": {
         "boxlite.restUrl": {
           "type": "string",
+          "scope": "application",
           "default": "https://api.boxlite.ai",
           "description": "BoxLite Cloud REST API URL (e.g. https://api.boxlite.ai)"
         },
         "boxlite.pythonPath": {
           "type": "string",
+          "scope": "application",
           "default": "",
           "description": "Custom path to python executable to run the BoxLite SDK bridge (leave empty for automatic resolution)"
         },
@@ -1044,11 +1046,13 @@
         },
         "boxlite.ssh.cliPath": {
           "type": "string",
+          "scope": "application",
           "default": "boxlite",
           "description": "Path to the BoxLite CLI executable used when boxlite.ssh.mode is set to 'cli'"
         },
         "boxlite.ssh.sshPath": {
           "type": "string",
+          "scope": "application",
           "default": "ssh",
           "description": "Path to the OpenSSH client executable (ssh)"
         },
@@ -1059,6 +1063,7 @@
         },
         "boxlite.ssh.manageConfig": {
           "type": "boolean",
+          "scope": "application",
           "default": false,
           "description": "Opt-in: automatically manage BoxLite Host blocks inside ~/.ssh/config for Remote-SSH"
         }

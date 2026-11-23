@@ -8,7 +8,8 @@ import {
   ImageGroupTreeItem,
   ImageTreeItem,
   ImageChildTreeItem,
-  formatBytes
+  formatBytes,
+  createErrorTreeItem
 } from './nodes';
 import {
   extractImageDigest,
@@ -255,7 +256,7 @@ export function buildImageList(
   };
 }
 
-export class ImagesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem> {
+export class ImagesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTreeItem>, vscode.Disposable {
   private _onDidChangeTreeData = new vscode.EventEmitter<BoxLiteTreeItem | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
@@ -273,6 +274,10 @@ export class ImagesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTr
 
   public refresh(): void {
     this._onDidChangeTreeData.fire();
+  }
+
+  public dispose(): void {
+    this._onDidChangeTreeData.dispose();
   }
 
   public getTreeItem(element: BoxLiteTreeItem): vscode.TreeItem {
@@ -307,32 +312,32 @@ export class ImagesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTr
         const defaultImageName = config.get<string>('defaultImage', 'python');
 
         // Fetch catalog images and active boxes concurrently
+        const [imgSettled, boxesSettled] = await Promise.allSettled([
+          this.bridge.listImages(),
+          this.bridge.listBoxes()
+        ]);
+
         let rawImages: ImageItem[] = [];
         let usage: ImageUsage | undefined;
-        try {
-          const imgRes = await this.bridge.listImages();
-          rawImages = Array.isArray(imgRes?.images) ? imgRes.images : [];
-          usage = imgRes?.usage;
-        } catch (e: any) {
-          const msg = e?.message || '';
+        if (imgSettled.status === 'fulfilled') {
+          rawImages = Array.isArray(imgSettled.value?.images) ? imgSettled.value.images : [];
+          usage = imgSettled.value?.usage;
+        } else {
+          const msg = imgSettled.reason?.message || String(imgSettled.reason || '');
           const isAuthOrForbidden =
             msg.includes('403') ||
             msg.toLowerCase().includes('forbidden') ||
             msg.includes('401') ||
             msg.toLowerCase().includes('unauthorized');
           if (isAuthOrForbidden) {
-            throw e;
+            throw imgSettled.reason;
           }
           // If the Cloud API or fallback does not support /images, gracefully degrade
           rawImages = [];
         }
 
-        let activeBoxes: BoxListItem[] = [];
-        try {
-          activeBoxes = await this.bridge.listBoxes();
-        } catch {
-          activeBoxes = [];
-        }
+        const activeBoxes: BoxListItem[] =
+          boxesSettled.status === 'fulfilled' && Array.isArray(boxesSettled.value) ? boxesSettled.value : [];
 
         const listResult = buildImageList(
           rawImages,
@@ -392,38 +397,17 @@ export class ImagesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTr
           }
         }
       } catch (err: any) {
-        const rawMsg = err?.message || String(err || '');
-        const is403 = rawMsg.includes('403') || rawMsg.toLowerCase().includes('forbidden');
-        const is401 = rawMsg.includes('401') || rawMsg.toLowerCase().includes('unauthorized');
-
-        let desc = rawMsg;
-        let tooltip = rawMsg;
-        let command = { command: 'boxlite.refreshImages', title: 'Retry' };
-
-        if (is403) {
-          desc = '403 Forbidden · Full access key required for custom images/registries';
-          tooltip = `BoxLite Cloud API Error (403): Forbidden resource.\n\nDiagnosis (agent.md §5 & docs.boxlite.ai/cloud/private-images):\nForbidden errors on private registry or catalog calls indicate an API key permission issue. These operations need Full access; a Boxes-only key cannot make them. Click to retry.`;
-        } else if (is401) {
-          desc = '401 Unauthorized · Invalid credentials';
-          tooltip = `BoxLite Cloud API Error (401): Unauthorized.\n\nDiagnosis (agent.md §5):\nCheck credentials. Configure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".`;
-          command = { command: 'boxlite.setApiKey', title: 'Sign In / Set API Key' };
-        } else {
-          const firstLine = rawMsg.split('\n')[0];
-          desc = firstLine.length > 60 ? firstLine.slice(0, 57) + '...' : firstLine;
-          tooltip = rawMsg;
-        }
-
         items.push(
-          new ImageChildTreeItem(
-            'Error loading images',
-            desc,
-            is403 ? 'lock' : (is401 ? 'key' : 'warning'),
-            command,
-            vscode.TreeItemCollapsibleState.None,
-            is403 ? 'image-forbidden' : 'image-error',
-            undefined,
-            tooltip
-          )
+          createErrorTreeItem({
+            label: 'Error loading images',
+            rawMessage: err?.message || String(err || ''),
+            retryCommand: 'boxlite.refreshImages',
+            contextPrefix: 'image',
+            forbiddenDescription: '403 Forbidden · Full access key required for custom images/registries',
+            forbiddenTooltip: `BoxLite Cloud API Error (403): Forbidden resource.\n\nDiagnosis (agent.md §5 & docs.boxlite.ai/cloud/private-images):\nForbidden errors on private registry or catalog calls indicate an API key permission issue. These operations need Full access; a Boxes-only key cannot make them. Click to retry.`,
+            unauthorizedTooltip: `BoxLite Cloud API Error (401): Unauthorized.\n\nDiagnosis (agent.md §5):\nCheck credentials. Configure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".`,
+            createItem: (...args) => new ImageChildTreeItem(...args)
+          })
         );
       }
 

@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { validateBoxId } from './parse';
 
 export interface GeneratedKeyPair {
   privateKeyPem: string;
@@ -182,8 +183,9 @@ export function ensureBoxKeyBundle(
   boxId: string,
   reset = false
 ): BoxKeyBundle {
+  const safeBoxId = validateBoxId(boxId);
   const scopeHash = buildScopeHash(scopeIdentity);
-  const directory = path.join(storageRootDir, 'ssh', scopeHash, boxId);
+  const directory = path.join(storageRootDir, 'ssh', scopeHash, safeBoxId);
   const clientKeyPath = path.join(directory, 'client_key');
   const clientPublicKeyPath = path.join(directory, 'client_key.pub');
   const hostKeyPath = path.join(directory, 'host_key');
@@ -268,8 +270,9 @@ export function ensureBoxKeyBundle(
 }
 
 export function removeBoxKeyBundle(storageRootDir: string, scopeIdentity: string, boxId: string): void {
+  const safeBoxId = validateBoxId(boxId);
   const scopeHash = buildScopeHash(scopeIdentity);
-  const directory = path.join(storageRootDir, 'ssh', scopeHash, boxId);
+  const directory = path.join(storageRootDir, 'ssh', scopeHash, safeBoxId);
   if (fs.existsSync(directory)) {
     fs.rmSync(directory, { recursive: true, force: true });
   }

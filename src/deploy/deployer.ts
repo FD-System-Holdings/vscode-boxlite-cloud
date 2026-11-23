@@ -36,7 +36,15 @@ export function matchesIgnorePattern(entryName: string, relativePath: string, pa
   return false;
 }
 
+export function isPathWithinRoot(rootDir: string, candidatePath: string): boolean {
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedCandidate = path.resolve(candidatePath);
+  const rel = path.relative(resolvedRoot, resolvedCandidate);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
 export function stageAppDirectory(appDir: string, ignorePatterns: string[]): string {
+  const resolvedAppDir = path.resolve(appDir);
   const stagingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-deploy-'));
 
   const copyFiltered = (srcDir: string, dstDir: string, relPrefix: string) => {
@@ -53,6 +61,10 @@ export function stageAppDirectory(appDir: string, ignorePatterns: string[]): str
         copyFiltered(srcPath, dstPath, relPath);
       } else if (entry.isSymbolicLink()) {
         const target = fs.readlinkSync(srcPath);
+        const resolvedTarget = path.resolve(srcDir, target);
+        if (!isPathWithinRoot(resolvedAppDir, resolvedTarget)) {
+          continue;
+        }
         fs.symlinkSync(target, dstPath);
       } else {
         fs.copyFileSync(srcPath, dstPath);
@@ -60,7 +72,7 @@ export function stageAppDirectory(appDir: string, ignorePatterns: string[]): str
     }
   };
 
-  copyFiltered(appDir, stagingDir, '');
+  copyFiltered(resolvedAppDir, stagingDir, '');
   return stagingDir;
 }
 
@@ -82,18 +94,26 @@ export function buildRestartCommand(startCmd: string = 'python3 -u server.py'): 
 }
 
 export function buildHealthProbeCommand(port: number, healthPath: string): string {
-  const normalizedPath = healthPath.startsWith('/') ? healthPath : `/${healthPath}`;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid health probe port: ${port}`);
+  }
+  const rawPath = (healthPath || '/healthz').trim();
+  if (/[\r\n\0]/.test(rawPath)) {
+    throw new Error('Invalid healthPath: control characters are not allowed.');
+  }
+  const normalizedPath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
   const url = `http://127.0.0.1:${port}${normalizedPath}`;
   const escapedUrl = url.replace(/'/g, "'\\''");
   return [
+    `BOXLITE_HEALTH_URL='${escapedUrl}'; export BOXLITE_HEALTH_URL;`,
     `if command -v curl >/dev/null 2>&1; then`,
-    `  curl -fsS --max-time 2 '${escapedUrl}' >/dev/null;`,
+    `  curl -fsS --max-time 2 "$BOXLITE_HEALTH_URL" >/dev/null;`,
     `elif command -v wget >/dev/null 2>&1; then`,
-    `  wget -q -T 2 -O /dev/null '${escapedUrl}';`,
+    `  wget -q -T 2 -O /dev/null "$BOXLITE_HEALTH_URL";`,
     `elif command -v python3 >/dev/null 2>&1; then`,
-    `  python3 -c "import urllib.request; r = urllib.request.urlopen('${escapedUrl}', timeout=2); assert 200 <= r.status < 300";`,
+    `  python3 -c 'import os, urllib.request; r = urllib.request.urlopen(os.environ["BOXLITE_HEALTH_URL"], timeout=2); assert 200 <= r.status < 300';`,
     `elif command -v node >/dev/null 2>&1; then`,
-    `  node -e "fetch('${escapedUrl}', { signal: AbortSignal.timeout(2000) }).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))";`,
+    `  node -e 'fetch(process.env.BOXLITE_HEALTH_URL, { signal: AbortSignal.timeout(2000) }).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))';`,
     `else`,
     `  exit 127;`,
     `fi`
@@ -128,6 +148,13 @@ export class BoxLiteDeployer {
     const { config, fileUri } = projectInfo;
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
     const appDir = path.resolve(workspaceRoot, config.appDir || './app');
+
+    if (workspaceRoot && !isPathWithinRoot(workspaceRoot, appDir)) {
+      vscode.window.showErrorMessage(
+        `Application directory "${config.appDir}" must stay inside the workspace folder.`
+      );
+      return;
+    }
 
     if (!fs.existsSync(appDir)) {
       vscode.window.showErrorMessage(`Application directory "${config.appDir}" does not exist in workspace.`);
@@ -401,7 +428,9 @@ export class BoxLiteDeployer {
           this.outputChannel.appendLine(`\n=== Deployment Complete! ===`);
           this.outputChannel.appendLine(`Public URL: ${publicUrl}`);
           if (tunnel.token) {
-            this.outputChannel.appendLine(`Access Token (Private): ${tunnel.token}`);
+            this.outputChannel.appendLine(
+              `Access Token (Private): ${CredentialsManager.redactKey(tunnel.token)} (use "Copy Private Access Token" in Boxes view)`
+            );
           }
 
           if (this.onDeploySuccess) {
@@ -421,7 +450,14 @@ export class BoxLiteDeployer {
             )
             .then(async (selection) => {
               if (selection === actionOpen) {
-                vscode.env.openExternal(vscode.Uri.parse(publicUrl));
+                try {
+                  const parsed = new URL(publicUrl);
+                  if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+                    vscode.env.openExternal(vscode.Uri.parse(publicUrl));
+                  }
+                } catch {
+                  // Ignore invalid URL
+                }
               } else if (selection === actionCopy) {
                 await vscode.env.clipboard.writeText(publicUrl);
                 vscode.window.showInformationMessage('Public URL copied to clipboard.');
@@ -438,9 +474,19 @@ export class BoxLiteDeployer {
   }
 }
 
+const HEALTH_LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
 function checkHttpHealth(targetUrl: string, token?: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const urlObj = new URL(targetUrl);
+    if (urlObj.protocol !== 'https:' && urlObj.protocol !== 'http:') {
+      reject(new Error(`Unsupported health check protocol: ${urlObj.protocol}`));
+      return;
+    }
+    if (token && urlObj.protocol === 'http:' && !HEALTH_LOOPBACK_HOSTS.has(urlObj.hostname.toLowerCase())) {
+      reject(new Error('Refusing to send private access token over insecure http:// URL.'));
+      return;
+    }
     const client = urlObj.protocol === 'https:' ? https : http;
 
     const headers: Record<string, string> = {};
