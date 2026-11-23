@@ -2764,14 +2764,20 @@ export function registerCommands(
     return { boxId };
   };
 
+  const connectViaSsh = async (item?: BoxTreeItem | string) => {
+    const svc = requireSshService();
+    if (!svc) return;
+    const target = await resolveBoxTarget(item);
+    if (!target) return;
+    await svc.connect(target.boxId, target.boxName);
+  };
+
   context.subscriptions.push(
-    vscode.commands.registerCommand('boxlite.sshConnect', async (item?: BoxTreeItem | string) => {
-      const svc = requireSshService();
-      if (!svc) return;
-      const target = await resolveBoxTarget(item);
-      if (!target) return;
-      await svc.connect(target.boxId, target.boxName);
-    })
+    vscode.commands.registerCommand('boxlite.sshConnect', connectViaSsh)
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('boxlite.sshConsole', connectViaSsh)
   );
 
   context.subscriptions.push(

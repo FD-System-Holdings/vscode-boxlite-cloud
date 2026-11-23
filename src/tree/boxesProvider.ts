@@ -173,6 +173,24 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
         );
       }
 
+      // 1b. SSH Console
+      const sshReady = this.sshStore?.isBoxSshReadySync(element.box.id) ?? false;
+      children.push(
+        new BoxChildTreeItem(
+          'SSH Console',
+          sshReady ? 'Configured · Connect via SSH' : 'Set up & connect via SSH',
+          'remote',
+          {
+            command: 'boxlite.sshConnect',
+            title: 'Connect via SSH',
+            arguments: [element]
+          },
+          vscode.TreeItemCollapsibleState.None,
+          sshReady ? 'box-ssh-action-ready' : 'box-ssh-action',
+          element.box.id
+        )
+      );
+
       // 2. Image readback (digest-pinned when booted from custom OCI image)
       if (element.box.image) {
         const shortRef = formatShortImageReference(element.box.image);
@@ -313,24 +331,6 @@ export class BoxesTreeDataProvider implements vscode.TreeDataProvider<BoxLiteTre
             title: 'Execute Command',
             arguments: [element]
           }
-        )
-      );
-
-      // 5b. SSH Console
-      const sshReady = this.sshStore?.isBoxSshReadySync(element.box.id) ?? false;
-      children.push(
-        new BoxChildTreeItem(
-          'SSH Console',
-          sshReady ? 'Configured · Connect via SSH' : 'Set up & connect via SSH',
-          'remote',
-          {
-            command: 'boxlite.sshConnect',
-            title: 'Connect via SSH',
-            arguments: [element]
-          },
-          vscode.TreeItemCollapsibleState.None,
-          sshReady ? 'box-ssh-action-ready' : 'box-ssh-action',
-          element.box.id
         )
       );
 

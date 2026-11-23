@@ -227,6 +227,12 @@
         "icon": "$(remote)"
       },
       {
+        "command": "boxlite.sshConsole",
+        "title": "SSH Console",
+        "category": "BoxLite",
+        "icon": "$(remote)"
+      },
+      {
         "command": "boxlite.sshSetup",
         "title": "Set Up / Reset SSH...",
         "category": "BoxLite",
@@ -742,9 +748,14 @@
           "group": "1_manage@3"
         },
         {
+          "command": "boxlite.sshConsole",
+          "when": "view == boxlite.boxesView && viewItem =~ /^box-.*/",
+          "group": "1_manage@4"
+        },
+        {
           "command": "boxlite.restartApp",
           "when": "view == boxlite.boxesView && viewItem =~ /.*isRunning.*/",
-          "group": "1_manage@4"
+          "group": "1_manage@5"
         },
         {
           "command": "boxlite.sshConnect",

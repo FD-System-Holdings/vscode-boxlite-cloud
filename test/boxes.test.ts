@@ -83,6 +83,50 @@ describe('Box Tree Items and Lifecycle Management', () => {
     assert.strictEqual(startNode.command?.command, 'boxlite.startBox');
   });
 
+  it('should place SSH Console right under Start Box / Stop Box in tree children', async () => {
+    const provider = new BoxesTreeDataProvider({} as any, {} as any);
+    const stoppedBox = new BoxTreeItem({
+      id: 'box-stopped-ssh',
+      name: 'stopped-box',
+      status: 'stopped',
+      image: 'python'
+    });
+    const runningBox = new BoxTreeItem({
+      id: 'box-running-ssh',
+      name: 'running-box',
+      status: 'running',
+      image: 'python'
+    });
+
+    const stoppedChildren = await provider.getChildren(stoppedBox);
+    assert.strictEqual(stoppedChildren[0]?.label, 'Start Box');
+    assert.strictEqual(stoppedChildren[1]?.label, 'SSH Console');
+    assert.strictEqual(stoppedChildren[1]?.command?.command, 'boxlite.sshConnect');
+
+    const runningChildren = await provider.getChildren(runningBox);
+    assert.strictEqual(runningChildren[0]?.label, 'Stop Box');
+    assert.strictEqual(runningChildren[1]?.label, 'SSH Console');
+    assert.strictEqual(runningChildren[1]?.command?.command, 'boxlite.sshConnect');
+  });
+
+  it('should contribute SSH Console context menu item right under Start Box in package.json', () => {
+    const pkg = require('../../package.json');
+    const commands: Array<{ command: string; title: string }> = pkg.contributes?.commands || [];
+    const sshConsoleCmd = commands.find((c) => c.command === 'boxlite.sshConsole');
+    assert.ok(sshConsoleCmd, 'Expected boxlite.sshConsole command in package.json');
+    assert.strictEqual(sshConsoleCmd.title, 'SSH Console');
+
+    const contextMenus: Array<{ command: string; when?: string; group?: string }> =
+      pkg.contributes?.menus?.['view/item/context'] || [];
+    const startEntry = contextMenus.find((m) => m.command === 'boxlite.startBox' && m.group?.startsWith('1_manage@'));
+    const sshConsoleEntry = contextMenus.find((m) => m.command === 'boxlite.sshConsole');
+    assert.ok(startEntry, 'Expected boxlite.startBox in 1_manage group');
+    assert.ok(sshConsoleEntry, 'Expected boxlite.sshConsole in view/item/context');
+    assert.strictEqual(sshConsoleEntry.group, '1_manage@4');
+    assert.ok(sshConsoleEntry.when?.includes('view == boxlite.boxesView'));
+    assert.ok(sshConsoleEntry.when?.includes('viewItem =~ /^box-.*/'));
+  });
+
   it('should toggle Stop Streaming Logs when streaming is active', async () => {
     const mockLogManager: any = {
       isStreaming: (id: string) => id === 'box-active-log'
