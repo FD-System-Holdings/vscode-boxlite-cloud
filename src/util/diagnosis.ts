@@ -100,6 +100,78 @@ export function diagnoseError(errorMessage: string, code?: string): DiagnosticMe
     };
   }
 
+  if (lower.includes('domain_not_owned') || lower.includes('does not own')) {
+    return {
+      summary: 'Domain Not Owned by Organization',
+      checklist: [
+        'Reserve or request the domain first via "BoxLite: Request Domain..." or BoxLite Console -> Domains',
+        'Pass the full hostname (e.g. my-service.boxliteapp.com), not just the short label',
+        'Ensure your active API key belongs to the organization that owns the domain (docs.boxlite.ai/cloud/domains)'
+      ]
+    };
+  }
+
+  if (lower.includes('domain_count_limit_reached')) {
+    return {
+      summary: 'Organization Domain Allowance Reached',
+      checklist: [
+        'Your organization already holds its maximum number of platform domains',
+        'Unbinding a domain does NOT free a quota slot — reuse an existing unbound domain from the Domains view',
+        'Upgrade your plan or request a higher domain allowance in BoxLite Console (docs.boxlite.ai/cloud/domains)'
+      ]
+    };
+  }
+
+  if (lower.includes('subdomain_too_short')) {
+    return {
+      summary: 'Platform Subdomain Too Short',
+      checklist: [
+        'Choose a longer subdomain label meeting your organization minimum length requirement',
+        'Use lowercase letters, digits, and hyphens (docs.boxlite.ai/cloud/domains)'
+      ]
+    };
+  }
+
+  if (lower.includes('subdomain_taken')) {
+    return {
+      summary: 'Platform Subdomain Already Taken',
+      checklist: [
+        'That subdomain is held by another organization — choose a different short name',
+        'Check the Domains view to see domains already owned by your organization'
+      ]
+    };
+  }
+
+  if (lower.includes('region_not_supported')) {
+    return {
+      summary: 'Region Not Supported for Platform Subdomain',
+      checklist: [
+        'The target box lives in a region served by its own regional proxy',
+        'Use the box tunnel URL directly or deploy the box in the default region'
+      ]
+    };
+  }
+
+  if (lower.includes('platform_domain_not_configured')) {
+    return {
+      summary: 'Platform Domains Not Configured on Server',
+      checklist: [
+        'This BoxLite deployment does not have a platform domain suffix configured',
+        'Check your BOXLITE_REST_URL target or use Box tunnel preview URLs'
+      ]
+    };
+  }
+
+  if (lower.includes('domain_not_ready') || lower.includes('subscription_required') || lower.includes('subscription_not_ready')) {
+    return {
+      summary: 'Custom Domain Setup or Subscription Incomplete',
+      checklist: [
+        'Custom domains require an active subscription and completed DNS/HTTPS setup in BoxLite Console -> Domains',
+        'Platform subdomains (*.boxliteapp.com) do not require custom DNS or TLS setup'
+      ]
+    };
+  }
+
   if (lower.includes('502') || lower.includes('unreachable')) {
     return {
       summary: '502 Bad Gateway / Box Unreachable',

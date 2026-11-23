@@ -625,6 +625,106 @@ export function validateEnvAgainstSecrets(
   return { valid: true };
 }
 
+export const RESERVED_PLATFORM_SUBDOMAINS: ReadonlySet<string> = new Set([
+  'admin',
+  'api',
+  'app',
+  'auth',
+  'console',
+  'dashboard',
+  'docs',
+  'login',
+  'mail',
+  'proxy',
+  'status',
+  'www',
+  'boxes',
+  'checkpoints',
+  'domains',
+  'images',
+  'volumes'
+]);
+
+export function validatePlatformSubdomain(
+  input: string,
+  options?: { minLength?: number; domainSuffix?: string | null }
+): {
+  valid: boolean;
+  shortName?: string;
+  fullDomain?: string;
+  error?: string;
+} {
+  const trimmed = (input || '').trim().toLowerCase().replace(/\.+$/, '');
+  if (!trimmed) {
+    return { valid: false, error: 'Subdomain name cannot be empty.' };
+  }
+  if (trimmed.includes('://')) {
+    return { valid: false, error: 'Enter a subdomain name without a URL scheme (e.g. my-service).' };
+  }
+  if (trimmed.includes('/') || trimmed.includes('?') || trimmed.includes('#')) {
+    return { valid: false, error: 'Subdomain name cannot contain paths, query strings, or fragments.' };
+  }
+  if (trimmed.includes(':')) {
+    return { valid: false, error: 'Subdomain name cannot include a port specification.' };
+  }
+  if (/\s/.test(trimmed)) {
+    return { valid: false, error: 'Subdomain name cannot contain whitespace.' };
+  }
+
+  const configuredSuffix = options?.domainSuffix?.trim().replace(/^\.+/, '').toLowerCase();
+  const suffix = configuredSuffix || 'boxliteapp.com';
+  let shortName = trimmed;
+
+  if (trimmed.includes('.')) {
+    const marker = `.${suffix}`;
+    if (trimmed.endsWith(marker)) {
+      const candidate = trimmed.slice(0, -marker.length);
+      if (candidate && !candidate.includes('.')) {
+        shortName = candidate;
+      } else {
+        return {
+          valid: false,
+          error: `Enter a single short label before .${suffix} (e.g. my-service).`
+        };
+      }
+    } else {
+      return {
+        valid: false,
+        error: `Enter a short platform subdomain label (e.g. my-service -> my-service.${suffix}). Custom own-domains are configured in BoxLite Console -> Domains.`
+      };
+    }
+  }
+
+  if (shortName.length > 63) {
+    return { valid: false, error: 'Subdomain name cannot exceed 63 characters.' };
+  }
+  const minLen = options?.minLength;
+  if (typeof minLen === 'number' && minLen > 1 && shortName.length < minLen) {
+    return {
+      valid: false,
+      error: `Subdomain "${shortName}" is too short: a new platform domain requires at least ${minLen} characters.`
+    };
+  }
+  if (!/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(shortName)) {
+    return {
+      valid: false,
+      error: 'Use lowercase letters, digits, and hyphens, without starting or ending with a hyphen.'
+    };
+  }
+  if (/^\d+-/.test(shortName) || RESERVED_PLATFORM_SUBDOMAINS.has(shortName)) {
+    return {
+      valid: false,
+      error: `Subdomain "${shortName}" is reserved by BoxLite Cloud.`
+    };
+  }
+
+  return {
+    valid: true,
+    shortName,
+    fullDomain: `${shortName}.${suffix}`
+  };
+}
+
 export function validateCustomDomain(domain: string): {
   valid: boolean;
   normalized?: string;

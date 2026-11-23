@@ -5,6 +5,7 @@ import {
   BoxLiteTreeItem,
   DomainTreeItem,
   DomainChildTreeItem,
+  DomainAllowanceTreeItem,
   createErrorTreeItem
 } from './nodes';
 
@@ -71,14 +72,28 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
       }
 
       try {
-        const domains = await this.bridge.listDomains();
+        const listResult =
+          typeof this.bridge.listDomainsWithAllowance === 'function'
+            ? await this.bridge.listDomainsWithAllowance()
+            : { domains: await this.bridge.listDomains(), allowance: undefined };
+        const domains = listResult.domains || [];
+        const allowance = listResult.allowance;
+
+        if (allowance) {
+          items.push(new DomainAllowanceTreeItem(allowance));
+        }
+
         if (domains.length === 0) {
+          const emptyDesc =
+            allowance && allowance.remaining <= 0
+              ? 'Domain allowance full'
+              : 'Click to request a fixed public domain';
           items.push(
             new DomainChildTreeItem(
-              'No Custom Domains',
-              'Click to add a custom domain',
+              'No Domains Reserved',
+              emptyDesc,
               'add',
-              { command: 'boxlite.createDomain', title: 'Add Domain...' }
+              { command: 'boxlite.createDomain', title: 'Request Domain...' }
             )
           );
         } else {
@@ -104,10 +119,10 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
             retryCommand: 'boxlite.refreshDomains',
             contextPrefix: 'domain',
             forbiddenDescription: '403 Forbidden · Domains access denied',
-            forbiddenTooltip: 'BoxLite Cloud API Error (403): Forbidden.\n\nEnsure your API key has permission to manage domains.',
+            forbiddenTooltip: 'BoxLite Cloud API Error (403): Forbidden.\n\nEnsure your API key has Write Boxes permission to manage domains.',
             unauthorizedTooltip: 'BoxLite Cloud API Error (401): Unauthorized.\n\nConfigure your BOXLITE_API_KEY via "BoxLite: Sign In / Set API Key".',
-            unavailableDescription: 'Custom Domains API unavailable on this server',
-            unavailableTooltip: 'BoxLite Cloud REST endpoint /v1/domains returned 404/501.\n\nCustom Domains may not be enabled on this BoxLite Cloud target yet. Click to retry.',
+            unavailableDescription: 'Domains API unavailable on this server',
+            unavailableTooltip: 'BoxLite Cloud REST endpoint /v1/domains returned 404/501.\n\nDomains may not be enabled on this BoxLite Cloud target yet. Click to retry.',
             createItem: (...args) => new DomainChildTreeItem(...args)
           })
         );
@@ -119,19 +134,28 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
     if (element instanceof DomainTreeItem) {
       const dom = element.domain;
       const children: BoxLiteTreeItem[] = [];
-      const status = (dom.status || 'pending').toLowerCase().trim();
-      const domainKey = dom.id || dom.domain;
+      const hasTarget = Boolean(dom.boxId || dom.appId);
+      const status = (dom.status || (hasTarget ? 'active' : 'unbound')).toLowerCase().trim();
+      const domainKey = dom.domain || dom.id;
+      const isCustom = dom.kind === 'custom';
+      const hasExplicitDnsRecords = Boolean(dom.verificationRecordName && dom.verificationRecordValue);
 
-      const statusDesc = dom.errorReason ? `${status} (${dom.errorReason})` : status;
+      const statusDesc = dom.errorReason
+        ? `${status} (${dom.errorReason})`
+        : status === 'unbound' && !isCustom
+          ? 'unbound (ready to bind · no DNS setup required)'
+          : status;
       children.push(
         new DomainChildTreeItem(
           'Status',
           statusDesc,
           status === 'active' || status === 'verified' || status === 'ready'
             ? 'pass'
-            : status === 'failed' || status === 'error'
-              ? 'error'
-              : 'clock',
+            : status === 'unbound'
+              ? 'globe'
+              : status === 'failed' || status === 'error'
+                ? 'error'
+                : 'clock',
           undefined,
           vscode.TreeItemCollapsibleState.None,
           'domain-status',
@@ -139,10 +163,24 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
         )
       );
 
-      const targetLabel = dom.boxName || dom.boxId;
+      if (dom.kind) {
+        children.push(
+          new DomainChildTreeItem(
+            'Type',
+            isCustom ? 'Custom domain' : 'Platform (*.boxliteapp.com)',
+            'tag',
+            undefined,
+            vscode.TreeItemCollapsibleState.None,
+            'domain-kind',
+            domainKey
+          )
+        );
+      }
+
+      const targetLabel = dom.boxName || dom.boxId || dom.appId;
       const targetDesc = targetLabel
         ? `${targetLabel}${dom.port ? `:${dom.port}` : ''}`
-        : 'Unattached (click to bind to a Box)';
+        : 'Unbound (click to bind to a Box)';
       children.push(
         new DomainChildTreeItem(
           'Target Box',
@@ -159,15 +197,15 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
         )
       );
 
-      if (status === 'pending' || status === 'failed' || status === 'error') {
+      if ((isCustom || hasExplicitDnsRecords) && (status === 'pending' || status === 'failed' || status === 'error')) {
         children.push(
           new DomainChildTreeItem(
             'Verify DNS',
-            'Trigger DNS verification check',
+            'Check domain readiness & ownership',
             'check',
             {
               command: 'boxlite.verifyDomain',
-              title: 'Verify DNS',
+              title: 'Verify Domain',
               arguments: [element]
             },
             vscode.TreeItemCollapsibleState.None,
@@ -233,8 +271,23 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
       if (status === 'active' || status === 'verified' || status === 'ready') {
         children.push(
           new DomainChildTreeItem(
+            'Verify Routing',
+            'Check ownership, box status, and HTTPS reachability',
+            'pulse',
+            {
+              command: 'boxlite.verifyDomain',
+              title: 'Verify Domain',
+              arguments: [element]
+            },
+            vscode.TreeItemCollapsibleState.None,
+            'domain-verify-routing',
+            domainKey
+          )
+        );
+        children.push(
+          new DomainChildTreeItem(
             'Open in Browser',
-            `https://${dom.domain}`,
+            dom.url || `https://${dom.domain}`,
             'link-external',
             {
               command: 'boxlite.openDomainUrl',
@@ -243,6 +296,21 @@ export class DomainsTreeDataProvider implements vscode.TreeDataProvider<BoxLiteT
             },
             vscode.TreeItemCollapsibleState.None,
             'domain-open-url',
+            domainKey
+          )
+        );
+        children.push(
+          new DomainChildTreeItem(
+            'Unbind from Box',
+            'Stop routing (keeps domain reserved)',
+            'debug-disconnect',
+            {
+              command: 'boxlite.unbindDomain',
+              title: 'Unbind Domain',
+              arguments: [element]
+            },
+            vscode.TreeItemCollapsibleState.None,
+            'domain-unbind-action',
             domainKey
           )
         );

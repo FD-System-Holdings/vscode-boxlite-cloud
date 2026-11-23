@@ -243,13 +243,38 @@ export interface TailLogResult {
   status?: string;
 }
 
+export interface DomainAllowance {
+  limit: number;
+  used: number;
+  remaining: number;
+  minLength: number;
+  domainSuffix?: string | null;
+}
+
+export interface DomainVerificationChecks {
+  owned: boolean;
+  bound: boolean;
+  dnsRequired: boolean;
+  boxStatus?: string;
+  httpStatus?: number | null;
+  reachable?: boolean;
+}
+
 export interface DomainItem {
   id: string;
   domain: string;
-  status: 'active' | 'verified' | 'pending' | 'verifying' | 'failed' | 'deleting' | string;
+  url?: string;
+  kind?: 'platform' | 'custom' | string;
+  targetType?: 'box' | 'app' | string;
+  status: 'active' | 'unbound' | 'verified' | 'pending' | 'verifying' | 'failed' | 'deleting' | string;
   boxId?: string;
   boxName?: string;
+  appId?: string;
   port?: number;
+  verificationSummary?: string;
+  verificationChecks?: DomainVerificationChecks;
+  httpStatus?: number | null;
+  reachable?: boolean;
   verificationMethod?: string;
   verificationRecordName?: string;
   verificationRecordValue?: string;
@@ -260,10 +285,21 @@ export interface DomainItem {
   errorReason?: string;
 }
 
+export interface DomainListResult {
+  domains: DomainItem[];
+  allowance?: DomainAllowance;
+}
+
 export interface CreateDomainArgs {
   domain: string;
   boxId?: string;
   port?: number;
+}
+
+export interface BindDomainArgs {
+  domainKey: string;
+  boxId: string;
+  port: number;
 }
 
 export interface UpdateDomainArgs {

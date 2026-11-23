@@ -19,8 +19,8 @@ class FakeHttpResponse:
         self._body = json.dumps(payload).encode("utf-8") if payload is not None else b""
         self.status = status
 
-    def read(self):
-        return self._body
+    def read(self, amt=None):
+        return self._body[:amt] if amt is not None else self._body
 
     def __enter__(self):
         return self
@@ -105,6 +105,101 @@ class TestRestRuntimeFallback(unittest.IsolatedAsyncioTestCase):
                 ("DELETE", "https://api.boxlite.ai/v1/boxes/demo%20box?force=true", 30),
             ],
         )
+
+    async def test_domain_endpoints_match_boxlite_cloud_openapi(self):
+        rt = bridge.RestRuntimeFallback("https://api.boxlite.ai", "bl_test_key")
+        captured = []
+
+        def fake_urlopen(req, timeout=30):
+            body = json.loads(req.data.decode("utf-8")) if req.data else None
+            captured.append((req.get_method(), req.full_url, body))
+            if req.get_method() == "GET" and req.full_url.endswith("/v1/domains"):
+                return FakeHttpResponse({
+                    "domains": [
+                        {
+                            "hostname": "fd-system-holdings.boxliteapp.com",
+                            "kind": "platform",
+                            "url": "https://fd-system-holdings.boxliteapp.com",
+                            "target": None,
+                        },
+                        {
+                            "hostname": "api-demo.boxliteapp.com",
+                            "kind": "platform",
+                            "url": "https://api-demo.boxliteapp.com",
+                            "target": {"type": "box", "box": "box_1", "port": 8080},
+                        },
+                    ],
+                    "limit": 5,
+                    "used": 2,
+                    "remaining": 3,
+                    "min_length": 5,
+                    "domain_suffix": "boxliteapp.com",
+                })
+            if req.get_method() == "POST":
+                return FakeHttpResponse({
+                    "hostname": "my-service.boxliteapp.com",
+                    "url": "https://my-service.boxliteapp.com",
+                    "target": None,
+                })
+            if req.get_method() == "PUT":
+                return FakeHttpResponse({
+                    "hostname": "fd-system-holdings.boxliteapp.com",
+                    "url": "https://fd-system-holdings.boxliteapp.com",
+                    "target": {"type": "box", "box": "box_1", "port": 8080},
+                })
+            return FakeHttpResponse(None, status=204)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            listed = await rt.list_domains_with_allowance()
+            claimed = await rt.claim_domain("my-service.boxliteapp.com", domain_suffix="boxliteapp.com")
+            bound = await rt.bind_domain("fd-system-holdings.boxliteapp.com.", "box_1", 8080)
+            await rt.unbind_domain("fd-system-holdings.boxliteapp.com")
+
+        self.assertEqual(len(listed["domains"]), 2)
+        self.assertEqual(listed["allowance"]["remaining"], 3)
+        self.assertEqual(listed["allowance"]["domainSuffix"], "boxliteapp.com")
+        self.assertEqual(claimed["hostname"], "my-service.boxliteapp.com")
+        self.assertEqual(bound["target"], {"type": "box", "box": "box_1", "port": 8080})
+        self.assertEqual(
+            captured,
+            [
+                ("GET", "https://api.boxlite.ai/v1/domains", None),
+                ("POST", "https://api.boxlite.ai/v1/domains", {"name": "my-service"}),
+                (
+                    "PUT",
+                    "https://api.boxlite.ai/v1/domains/fd-system-holdings.boxliteapp.com/target",
+                    {"type": "box", "box": "box_1", "port": 8080},
+                ),
+                (
+                    "DELETE",
+                    "https://api.boxlite.ai/v1/domains/fd-system-holdings.boxliteapp.com/target",
+                    None,
+                ),
+            ],
+        )
+
+    async def test_http_error_surfaces_code_and_list_messages(self):
+        rt = bridge.RestRuntimeFallback("https://api.boxlite.ai", "bl_test_key")
+
+        def raise_404(req, timeout=30):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                404,
+                "Not Found",
+                hdrs=None,
+                fp=io.BytesIO(
+                    json.dumps({
+                        "code": "domain_not_owned",
+                        "message": ["This organization does not own demo.boxliteapp.com."],
+                    }).encode("utf-8")
+                ),
+            )
+
+        with patch("urllib.request.urlopen", side_effect=raise_404):
+            with self.assertRaises(RuntimeError) as ctx:
+                await rt.bind_domain("demo.boxliteapp.com", "box_1", 8080)
+            self.assertIn("[domain_not_owned]", str(ctx.exception))
+            self.assertIn("does not own demo.boxliteapp.com", str(ctx.exception))
 
 
 class TestBoxLiteBridge(unittest.IsolatedAsyncioTestCase):
@@ -340,6 +435,152 @@ class TestBoxLiteBridge(unittest.IsolatedAsyncioTestCase):
         diag = captured[0][2]["diagnosis"]
         self.assertIn("Requested resources exceed per-box limits", diag)
         self.assertNotIn("auto_remove", diag)
+
+    async def test_handle_list_domains_handles_native_sdk_domain_list_and_derives_status(self):
+        br = bridge.BoxLiteBridge()
+
+        class FakeTarget:
+            type = "box"
+            box = "box_99"
+            port = 3000
+
+        class FakeDomainObj:
+            def __init__(self, hostname, target):
+                self.hostname = hostname
+                self.url = f"https://{hostname}"
+                self.target = target
+
+        class FakeDomainList:
+            domains = [
+                FakeDomainObj("fd-system-holdings.boxliteapp.com", None),
+                FakeDomainObj("app-live.boxliteapp.com", FakeTarget()),
+            ]
+            limit = 5
+            used = 2
+            remaining = 3
+            min_length = 5
+
+        class FakeDomainsHandle:
+            async def list(self):
+                return FakeDomainList()
+
+        class FakeNativeRuntime:
+            domains = FakeDomainsHandle()
+
+        br.rt = FakeNativeRuntime()
+        res = await br.handle_list_domains({})
+        self.assertEqual(len(res["domains"]), 2)
+        self.assertEqual(res["domains"][0]["domain"], "fd-system-holdings.boxliteapp.com")
+        self.assertEqual(res["domains"][0]["status"], "unbound")
+        self.assertEqual(res["domains"][0]["kind"], "platform")
+        self.assertEqual(res["domains"][1]["status"], "active")
+        self.assertEqual(res["domains"][1]["boxId"], "box_99")
+        self.assertEqual(res["domains"][1]["port"], 3000)
+        self.assertEqual(res["allowance"], {"limit": 5, "used": 2, "remaining": 3, "minLength": 5, "domainSuffix": None})
+
+    async def test_handle_inspect_and_verify_domain_never_post_verify_and_check_reachability(self):
+        br = bridge.BoxLiteBridge()
+        br.rt = bridge.RestRuntimeFallback("https://api.boxlite.ai", "bl_test_key")
+
+        domains_payload = {
+            "domains": [
+                {
+                    "hostname": "fd-system-holdings.boxliteapp.com",
+                    "kind": "platform",
+                    "url": "https://fd-system-holdings.boxliteapp.com",
+                    "target": None,
+                },
+                {
+                    "hostname": "live-app.boxliteapp.com",
+                    "kind": "platform",
+                    "url": "https://live-app.boxliteapp.com",
+                    "target": {"type": "box", "box": "box_1", "port": 8080},
+                },
+            ],
+            "limit": 5,
+            "used": 2,
+            "remaining": 3,
+            "min_length": 5,
+            "domain_suffix": "boxliteapp.com",
+        }
+        probe_status = 200
+        requests = []
+
+        def fake_urlopen(req, timeout=30):
+            requests.append((req.get_method(), req.full_url, dict(req.header_items())))
+            if "/verify" in req.full_url:
+                raise AssertionError(f"Must never call /verify endpoint: {req.full_url}")
+            if req.full_url == "https://api.boxlite.ai/v1/domains":
+                return FakeHttpResponse(domains_payload)
+            if req.full_url == "https://api.boxlite.ai/v1/boxes/box_1":
+                return FakeHttpResponse({"id": "box_1", "status": "running"})
+            if req.full_url == "https://live-app.boxliteapp.com":
+                if probe_status >= 400:
+                    raise urllib.error.HTTPError(
+                        req.full_url, probe_status, "Err", hdrs=None, fp=io.BytesIO(b"")
+                    )
+                return FakeHttpResponse(None, status=probe_status)
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            inspected = await br.handle_inspect_domain({"domainKey": "fd-system-holdings.boxliteapp.com"})
+            self.assertEqual(inspected["domain"]["status"], "unbound")
+            self.assertEqual(inspected["domain"]["allowance"]["limit"], 5)
+
+            unbound_ver = await br.handle_verify_domain({"domainKey": "fd-system-holdings.boxliteapp.com"})
+            self.assertEqual(unbound_ver["status"], "unbound")
+            self.assertFalse(unbound_ver["reachable"])
+            self.assertEqual(unbound_ver["verificationChecks"]["owned"], True)
+            self.assertEqual(unbound_ver["verificationChecks"]["bound"], False)
+            self.assertEqual(unbound_ver["verificationChecks"]["dnsRequired"], False)
+
+            ok_ver = await br.handle_verify_domain({"domainKey": "live-app.boxliteapp.com"})
+            self.assertTrue(ok_ver["reachable"])
+            self.assertEqual(ok_ver["httpStatus"], 200)
+            self.assertIn("verified and reachable", ok_ver["verificationSummary"])
+
+            probe_headers = [h for m, u, h in requests if u == "https://live-app.boxliteapp.com"][0]
+            self.assertEqual(probe_headers.get("X-boxlite-skip-preview-warning"), "true")
+
+            probe_status = 404
+            missing_tunnel_ver = await br.handle_verify_domain({"domainKey": "live-app.boxliteapp.com"})
+            self.assertFalse(missing_tunnel_ver["reachable"])
+            self.assertEqual(missing_tunnel_ver["httpStatus"], 404)
+            self.assertIn("public tunnel", missing_tunnel_ver["verificationSummary"])
+
+            probe_status = 502
+            bad_gw_ver = await br.handle_verify_domain({"domainKey": "live-app.boxliteapp.com"})
+            self.assertFalse(bad_gw_ver["reachable"])
+            self.assertIn("0.0.0.0:8080", bad_gw_ver["verificationSummary"])
+
+            probe_status = 503
+            waking_ver = await br.handle_verify_domain({"domainKey": "live-app.boxliteapp.com"})
+            self.assertFalse(waking_ver["reachable"])
+            self.assertIn("503", waking_ver["verificationSummary"])
+
+            with self.assertRaises(RuntimeError) as not_owned_ctx:
+                await br.handle_verify_domain({"domainKey": "unknown.boxliteapp.com"})
+            self.assertIn("domain_not_owned", str(not_owned_ctx.exception))
+
+    async def test_dispatch_diagnoses_domain_error_codes(self):
+        br = bridge.BoxLiteBridge()
+
+        for msg, expected in [
+            ("BoxLite Cloud API error (404) [domain_not_owned]: does not own x.boxliteapp.com", "Domain not owned"),
+            ("BoxLite Cloud API error (400) [domain_count_limit_reached]: full", "domain allowance reached"),
+            ("BoxLite Cloud API error (400) [subdomain_too_short]: short", "too short"),
+            ("BoxLite Cloud API error (409) [subdomain_taken]: taken", "already taken"),
+        ]:
+            async def fail(_args, m=msg):
+                raise RuntimeError(m)
+
+            br.handle_verify_domain = fail
+            captured = []
+            with patch.object(bridge, "send_response", side_effect=lambda req_id, ok, data=None, error=None: captured.append((req_id, ok, error))):
+                await br.dispatch({"id": "req_d", "op": "verify_domain", "args": {}})
+            self.assertEqual(len(captured), 1)
+            self.assertFalse(captured[0][1])
+            self.assertIn(expected.lower(), captured[0][2]["diagnosis"].lower())
 
 
 if __name__ == "__main__":

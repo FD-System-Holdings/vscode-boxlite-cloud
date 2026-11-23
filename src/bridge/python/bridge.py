@@ -221,12 +221,29 @@ class RestRuntimeFallback:
                 return {}
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
+            err_code = None
             try:
                 err_json = json.loads(err_body)
-                msg = err_json.get("message") or err_json.get("error") or str(e)
+                if isinstance(err_json, dict):
+                    raw_err = err_json.get("error")
+                    err_code = err_json.get("code") or (raw_err.get("code") if isinstance(raw_err, dict) else None)
+                    raw_msg = err_json.get("message")
+                    if isinstance(raw_msg, list):
+                        msg = "; ".join(str(m) for m in raw_msg)
+                    elif raw_msg:
+                        msg = str(raw_msg)
+                    elif isinstance(raw_err, str):
+                        msg = raw_err
+                    elif isinstance(raw_err, dict) and raw_err.get("message"):
+                        msg = str(raw_err["message"])
+                    else:
+                        msg = str(e)
+                else:
+                    msg = str(e)
             except Exception:
                 msg = f"HTTP {e.code}: {err_body or e.reason}"
-            raise RuntimeError(f"BoxLite Cloud API error ({e.code}): {msg}")
+            code_tag = f" [{err_code}]" if err_code else ""
+            raise RuntimeError(f"BoxLite Cloud API error ({e.code}){code_tag}: {msg}")
         except urllib.error.URLError as e:
             raise RuntimeError(f"NetworkError connecting to BoxLite Cloud ({self.rest_url}): {e.reason}")
 
@@ -455,63 +472,135 @@ class RestRuntimeFallback:
         path = f"/checkpoints/{encoded_key}?force=true" if force else f"/checkpoints/{encoded_key}"
         await loop.run_in_executor(None, self._request, "DELETE", path)
 
-    async def list_domains(self) -> List[Dict[str, Any]]:
-        loop = asyncio.get_running_loop()
-        domains: List[Dict[str, Any]] = []
-        page_token: Optional[str] = None
-        while True:
-            path = "/domains"
-            if page_token:
-                path = f"/domains?pageToken={urllib.parse.quote(page_token, safe='')}"
-            res = await loop.run_in_executor(None, self._request, "GET", path)
-            if isinstance(res, dict):
-                page_items = res.get("domains") or res.get("items")
-                if isinstance(page_items, list):
-                    domains.extend(page_items)
-                next_token = res.get("next_page_token") or res.get("nextPageToken")
-                if not next_token:
-                    break
-                page_token = next_token
-            elif isinstance(res, list):
-                domains.extend(res)
-                break
-            else:
-                break
-        return domains
+    def _normalize_domain_key(self, key: str) -> str:
+        return (key or "").strip().rstrip(".").lower()
 
-    async def get_domain(self, key: str) -> Dict[str, Any]:
+    async def list_domains_with_allowance(self) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        encoded_key = urllib.parse.quote(key, safe="")
-        return await loop.run_in_executor(None, self._request, "GET", f"/domains/{encoded_key}")
+        res = await loop.run_in_executor(None, self._request, "GET", "/domains")
+        allowance: Optional[Dict[str, Any]] = None
+        if isinstance(res, dict):
+            domains = res.get("domains")
+            if not isinstance(domains, list):
+                domains = res.get("items") if isinstance(res.get("items"), list) else []
+            if any(k in res for k in ("limit", "used", "remaining")):
+                allowance = {
+                    "limit": int(res.get("limit", 0)),
+                    "used": int(res.get("used", 0)),
+                    "remaining": int(res.get("remaining", 0)),
+                    "minLength": int(res.get("min_length", res.get("minLength", 1))),
+                    "domainSuffix": res.get("domain_suffix", res.get("domainSuffix")),
+                }
+            return {"domains": domains, "allowance": allowance}
+        if isinstance(res, list):
+            return {"domains": res, "allowance": None}
+        return {"domains": [], "allowance": None}
+
+    async def list_domains(self) -> List[Dict[str, Any]]:
+        res = await self.list_domains_with_allowance()
+        return res["domains"]
+
+    async def claim_domain(self, name: str, domain_suffix: Optional[str] = None) -> Dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        short_name = self._normalize_domain_key(name)
+        suffixes: List[str] = []
+        if domain_suffix:
+            cleaned = domain_suffix.strip().lstrip(".").lower()
+            if cleaned:
+                suffixes.append(cleaned)
+        if "boxliteapp.com" not in suffixes:
+            suffixes.append("boxliteapp.com")
+        for suffix in suffixes:
+            marker = f".{suffix}"
+            if short_name.endswith(marker):
+                short_name = short_name[: -len(marker)]
+                break
+        if not short_name:
+            raise ValueError("Domain short name cannot be empty.")
+        return await loop.run_in_executor(None, self._request, "POST", "/domains", {"name": short_name})
 
     async def create_domain(self, domain: str, box_id: Optional[str] = None, port: Optional[int] = None) -> Dict[str, Any]:
+        claimed = await self.claim_domain(domain)
+        if box_id and port is not None:
+            hostname = claimed.get("hostname") or claimed.get("domain") or domain
+            return await self.bind_domain(str(hostname), str(box_id), int(port))
+        return claimed
+
+    async def bind_domain(self, domain: str, box_id: str, port: int) -> Dict[str, Any]:
         loop = asyncio.get_running_loop()
-        body: Dict[str, Any] = {"domain": domain}
-        if box_id:
-            body["box_id"] = box_id
-        if port is not None:
-            body["port"] = int(port)
-        return await loop.run_in_executor(None, self._request, "POST", "/domains", body)
+        hostname = self._normalize_domain_key(domain)
+        if "." not in hostname:
+            raise ValueError(f"Bind requires a full hostname (e.g. my-service.boxliteapp.com), got '{domain}'.")
+        encoded_domain = urllib.parse.quote(hostname, safe="")
+        body = {"type": "box", "box": str(box_id), "port": int(port)}
+        return await loop.run_in_executor(None, self._request, "PUT", f"/domains/{encoded_domain}/target", body)
+
+    async def unbind_domain(self, domain: str) -> None:
+        loop = asyncio.get_running_loop()
+        hostname = self._normalize_domain_key(domain)
+        if "." not in hostname:
+            raise ValueError(f"Unbind requires a full hostname (e.g. my-service.boxliteapp.com), got '{domain}'.")
+        encoded_domain = urllib.parse.quote(hostname, safe="")
+        await loop.run_in_executor(None, self._request, "DELETE", f"/domains/{encoded_domain}/target")
+
+    async def get_domain(self, key: str) -> Dict[str, Any]:
+        normalized_key = self._normalize_domain_key(key)
+        res = await self.list_domains_with_allowance()
+        for item in res["domains"]:
+            if not isinstance(item, dict):
+                continue
+            item_host = self._normalize_domain_key(
+                item.get("hostname") or item.get("domain") or item.get("name") or item.get("id") or ""
+            )
+            item_id = self._normalize_domain_key(item.get("id") or "")
+            if normalized_key and (item_host == normalized_key or item_id == normalized_key):
+                out = dict(item)
+                if res.get("allowance") is not None:
+                    out["allowance"] = res["allowance"]
+                return out
+        raise RuntimeError(
+            f"BoxLite Cloud API error (404) [domain_not_owned]: This organization does not own {normalized_key}. "
+            "Request a domain in Dashboard > Domains before binding."
+        )
+
+    def probe_domain_url(self, url: str, timeout: int = 10) -> Dict[str, Any]:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("https", "http"):
+            raise ValueError(f"Unsupported domain URL scheme: {url}")
+        headers = {
+            "X-BoxLite-Skip-Preview-Warning": "true",
+            "User-Agent": "rc-boxlite-vscode/0.1.0",
+        }
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp.read(1024)
+                return {"http_status": int(resp.status), "error": None}
+        except urllib.error.HTTPError as e:
+            return {"http_status": int(e.code), "error": None}
+        except (urllib.error.URLError, OSError) as e:
+            return {"http_status": None, "error": str(getattr(e, "reason", e))}
 
     async def verify_domain(self, key: str) -> Dict[str, Any]:
-        loop = asyncio.get_running_loop()
-        encoded_key = urllib.parse.quote(key, safe="")
-        return await loop.run_in_executor(None, self._request, "POST", f"/domains/{encoded_key}/verify", {})
+        return await self.get_domain(key)
 
     async def update_domain(self, key: str, box_id: Any = _UNSET, port: Any = _UNSET) -> Dict[str, Any]:
-        loop = asyncio.get_running_loop()
-        encoded_key = urllib.parse.quote(key, safe="")
-        body: Dict[str, Any] = {}
-        if box_id is not _UNSET:
-            body["box_id"] = box_id if box_id else None
-        if port is not _UNSET:
-            body["port"] = int(port) if port is not None else None
-        return await loop.run_in_executor(None, self._request, "PATCH", f"/domains/{encoded_key}", body)
+        hostname = self._normalize_domain_key(key)
+        if box_id is None or box_id == "":
+            await self.unbind_domain(hostname)
+            return {"hostname": hostname, "url": f"https://{hostname}", "target": None}
+        if box_id is _UNSET:
+            raise ValueError("box_id is required to bind a domain.")
+        if port is _UNSET or port is None:
+            raise ValueError("port is required to bind a domain.")
+        return await self.bind_domain(hostname, str(box_id), int(port))
 
     async def remove_domain(self, key: str) -> None:
-        loop = asyncio.get_running_loop()
-        encoded_key = urllib.parse.quote(key, safe="")
-        await loop.run_in_executor(None, self._request, "DELETE", f"/domains/{encoded_key}")
+        raise RuntimeError(
+            "BoxLite Cloud /v1/domains does not support deleting reserved domains. "
+            "Use 'Unbind Domain' (DELETE /v1/domains/{domain}/target) to stop routing while keeping the hostname reserved, "
+            "or manage custom domains in BoxLite Console (https://app.boxlite.ai)."
+        )
 
 
 class BoxLiteBridge:
@@ -1971,12 +2060,17 @@ class BoxLiteBridge:
 
     def _format_domain(self, d: Any) -> Dict[str, Any]:
         if isinstance(d, dict):
-            raw_id = d.get("id") or d.get("domain_id") or d.get("domainId") or ""
-            domain_name = d.get("domain") or d.get("hostname") or d.get("name") or raw_id
-            status_val = d.get("status") or d.get("state") or "pending"
+            domain_name = d.get("hostname") or d.get("domain") or d.get("name") or d.get("id") or ""
+            raw_id = d.get("id") or d.get("domain_id") or d.get("domainId") or domain_name
+            url_val = d.get("url") or (f"https://{domain_name}" if domain_name else "")
+            kind_val = d.get("kind")
+            target = d.get("target")
+            status_val = d.get("status") or d.get("state")
             box_id = d.get("box_id") or d.get("boxId")
             box_name = d.get("box_name") or d.get("boxName")
             port = d.get("port")
+            app_id = d.get("app_id") or d.get("appId")
+            target_type = d.get("target_type") or d.get("targetType")
             verification_method = d.get("verification_method") or d.get("verificationMethod")
             verification_record_name = d.get("verification_record_name") or d.get("verificationRecordName")
             verification_record_value = d.get("verification_record_value") or d.get("verificationRecordValue")
@@ -1986,12 +2080,23 @@ class BoxLiteBridge:
             updated_at = d.get("updated_at") or d.get("updatedAt")
             error_reason = d.get("error_reason") or d.get("errorReason") or d.get("error")
         else:
-            raw_id = getattr(d, "id", "") or ""
-            domain_name = getattr(d, "domain", None) or getattr(d, "hostname", None) or getattr(d, "name", None) or raw_id
-            status_val = getattr(d, "status", None) or getattr(d, "state", "pending")
+            domain_name = (
+                getattr(d, "hostname", None)
+                or getattr(d, "domain", None)
+                or getattr(d, "name", None)
+                or getattr(d, "id", "")
+                or ""
+            )
+            raw_id = getattr(d, "id", None) or domain_name
+            url_val = getattr(d, "url", None) or (f"https://{domain_name}" if domain_name else "")
+            kind_val = getattr(d, "kind", None)
+            target = getattr(d, "target", None)
+            status_val = getattr(d, "status", None) or getattr(d, "state", None)
             box_id = getattr(d, "box_id", None) or getattr(d, "boxId", None)
             box_name = getattr(d, "box_name", None) or getattr(d, "boxName", None)
             port = getattr(d, "port", None)
+            app_id = getattr(d, "app_id", None) or getattr(d, "appId", None)
+            target_type = getattr(d, "target_type", None) or getattr(d, "targetType", None)
             verification_method = getattr(d, "verification_method", None) or getattr(d, "verificationMethod", None)
             verification_record_name = getattr(d, "verification_record_name", None) or getattr(d, "verificationRecordName", None)
             verification_record_value = getattr(d, "verification_record_value", None) or getattr(d, "verificationRecordValue", None)
@@ -2001,22 +2106,52 @@ class BoxLiteBridge:
             updated_at = getattr(d, "updated_at", None) or getattr(d, "updatedAt", None)
             error_reason = getattr(d, "error_reason", None) or getattr(d, "errorReason", None)
 
+        if target is not None:
+            t_type = target.get("type") if isinstance(target, dict) else getattr(target, "type", None)
+            if t_type == "box":
+                target_type = "box"
+                t_box = target.get("box") if isinstance(target, dict) else getattr(target, "box", None)
+                t_port = target.get("port") if isinstance(target, dict) else getattr(target, "port", None)
+                if t_box:
+                    box_id = t_box
+                if t_port is not None:
+                    port = int(t_port)
+            elif t_type == "app":
+                target_type = "app"
+                t_app = target.get("app") if isinstance(target, dict) else getattr(target, "app", None)
+                if t_app:
+                    app_id = t_app
+
         if not raw_id:
             raw_id = str(domain_name)
 
-        status_str = str(getattr(status_val, "value", getattr(status_val, "name", status_val))).lower()
-        if "." in status_str:
-            status_str = status_str.split(".")[-1]
+        if not kind_val and isinstance(domain_name, str) and domain_name.lower().endswith(".boxliteapp.com"):
+            kind_val = "platform"
+
+        if status_val:
+            status_str = str(getattr(status_val, "value", getattr(status_val, "name", status_val))).lower()
+            if "." in status_str:
+                status_str = status_str.split(".")[-1]
+        else:
+            status_str = "active" if (box_id or app_id) else "unbound"
 
         out: Dict[str, Any] = {
             "id": str(raw_id),
             "domain": str(domain_name),
-            "status": status_str or "pending",
+            "status": status_str,
         }
+        if url_val:
+            out["url"] = str(url_val)
+        if kind_val:
+            out["kind"] = str(kind_val)
+        if target_type:
+            out["targetType"] = str(target_type)
         if box_id:
             out["boxId"] = str(box_id)
         if box_name:
             out["boxName"] = str(box_name)
+        if app_id:
+            out["appId"] = str(app_id)
         if port is not None:
             out["port"] = int(port)
         if verification_method:
@@ -2037,108 +2172,251 @@ class BoxLiteBridge:
             out["errorReason"] = str(error_reason)
         return out
 
+    def _extract_domain_list(self, raw: Any) -> tuple[List[Any], Optional[Dict[str, Any]]]:
+        if raw is None:
+            return [], None
+        if isinstance(raw, list):
+            return raw, None
+        if isinstance(raw, dict):
+            items = raw.get("domains")
+            if not isinstance(items, list):
+                items = raw.get("items") if isinstance(raw.get("items"), list) else []
+            allowance = raw.get("allowance")
+            if allowance is None and any(k in raw for k in ("limit", "used", "remaining")):
+                allowance = {
+                    "limit": int(raw.get("limit", 0)),
+                    "used": int(raw.get("used", 0)),
+                    "remaining": int(raw.get("remaining", 0)),
+                    "minLength": int(raw.get("min_length", raw.get("minLength", 1))),
+                    "domainSuffix": raw.get("domain_suffix", raw.get("domainSuffix")),
+                }
+            return items, allowance
+        items = list(getattr(raw, "domains", None) or [])
+        allowance = None
+        if hasattr(raw, "limit") or hasattr(raw, "used") or hasattr(raw, "remaining"):
+            allowance = {
+                "limit": int(getattr(raw, "limit", 0)),
+                "used": int(getattr(raw, "used", 0)),
+                "remaining": int(getattr(raw, "remaining", 0)),
+                "minLength": int(getattr(raw, "min_length", getattr(raw, "minLength", 1))),
+                "domainSuffix": getattr(raw, "domain_suffix", getattr(raw, "domainSuffix", None)),
+            }
+        return items, allowance
+
     async def handle_list_domains(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         domains = None
+        allowance = None
         handle = self._get_domain_handle(rt)
         if handle is not None and hasattr(handle, "list") and callable(handle.list):
             try:
-                domains = await handle.list()
+                raw = await handle.list()
+                domains, allowance = self._extract_domain_list(raw)
             except Exception as e:
                 log_debug(f"rt.domains.list() failed ({e}), falling back to REST")
 
         if domains is None:
-            domains = await self._rest_fallback(rt).list_domains()
+            raw = await self._rest_fallback(rt).list_domains_with_allowance()
+            domains, allowance = self._extract_domain_list(raw)
 
-        return {"domains": [self._format_domain(d) for d in (domains or [])]}
+        out: Dict[str, Any] = {"domains": [self._format_domain(d) for d in (domains or [])]}
+        if allowance is not None:
+            out["allowance"] = allowance
+        return out
 
     async def handle_create_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
-        domain = args["domain"]
+        raw_name = args.get("name") or args.get("domain") or ""
         box_id = args.get("boxId")
         port = args.get("port")
 
+        res = await self._rest_fallback(rt).claim_domain(raw_name)
+        formatted = self._format_domain(res)
+        if box_id and port is not None:
+            return await self.handle_bind_domain({
+                "domainKey": formatted["domain"],
+                "boxId": box_id,
+                "port": int(port),
+            })
+        return formatted
+
+    async def handle_bind_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        rt = self.ensure_runtime()
+        raw_key = args.get("domainKey") or args.get("domain") or ""
+        hostname = raw_key.strip().rstrip(".").lower()
+        box_id = str(args["boxId"])
+        port = int(args["port"])
+
         handle = self._get_domain_handle(rt)
-        if handle is not None and hasattr(handle, "create") and callable(handle.create):
+        if handle is not None and hasattr(handle, "bind") and callable(handle.bind):
             try:
-                info = await handle.create(domain, box_id=box_id, port=port)
+                import boxlite
+                target = boxlite.DomainTarget(type="box", box=box_id, port=port)
+                info = await handle.bind(hostname, target)
                 return self._format_domain(info)
             except Exception as e:
-                log_debug(f"rt.domains.create() failed ({e}), falling back to REST")
+                log_debug(f"rt.domains.bind() failed ({e}), falling back to REST")
 
-        res = await self._rest_fallback(rt).create_domain(domain, box_id=box_id, port=port)
+        res = await self._rest_fallback(rt).bind_domain(hostname, box_id, port)
         return self._format_domain(res)
 
-    async def handle_inspect_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def handle_unbind_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
-        key = args["domainKey"]
+        raw_key = args.get("domainKey") or args.get("domain") or ""
+        hostname = raw_key.strip().rstrip(".").lower()
 
         handle = self._get_domain_handle(rt)
-        if handle is not None and hasattr(handle, "get") and callable(handle.get):
+        if handle is not None and hasattr(handle, "unbind") and callable(handle.unbind):
             try:
-                info = await handle.get(key)
-                if hasattr(info, "to_dict"):
-                    data = info.to_dict()
-                elif hasattr(info, "__dict__"):
-                    data = {k: v for k, v in info.__dict__.items() if not k.startswith("_")}
-                else:
-                    data = self._format_domain(info)
-                return {"domain": data}
+                await handle.unbind(hostname)
+                return {"domainKey": hostname, "unbound": True}
             except Exception as e:
-                log_debug(f"rt.domains.get() failed ({e}), falling back to REST")
+                log_debug(f"rt.domains.unbind() failed ({e}), falling back to REST")
 
-        res = await self._rest_fallback(rt).get_domain(key)
-        return {"domain": res}
+        await self._rest_fallback(rt).unbind_domain(hostname)
+        return {"domainKey": hostname, "unbound": True}
+
+    async def handle_inspect_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        key = (args.get("domainKey") or "").strip().rstrip(".").lower()
+        listed = await self.handle_list_domains({})
+        matched = None
+        for d in listed.get("domains", []):
+            if (d.get("domain") or "").lower() == key or (d.get("id") or "").lower() == key:
+                matched = dict(d)
+                break
+        if matched is None:
+            raise RuntimeError(
+                f"BoxLite Cloud API error (404) [domain_not_owned]: This organization does not own {key}. "
+                "Request a domain in Dashboard > Domains before binding."
+            )
+        if "allowance" in listed:
+            matched["allowance"] = listed["allowance"]
+        return {"domain": matched}
 
     async def handle_verify_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
-        key = args["domainKey"]
+        key = (args.get("domainKey") or "").strip().rstrip(".").lower()
+        listed = await self.handle_list_domains({})
+        matched = None
+        for d in listed.get("domains", []):
+            if (d.get("domain") or "").lower() == key or (d.get("id") or "").lower() == key:
+                matched = dict(d)
+                break
+        if matched is None:
+            raise RuntimeError(
+                f"BoxLite Cloud API error (404) [domain_not_owned]: This organization does not own {key}. "
+                "Request a domain in Dashboard > Domains before binding."
+            )
 
-        handle = self._get_domain_handle(rt)
-        if handle is not None and hasattr(handle, "verify") and callable(handle.verify):
+        hostname = matched.get("domain") or key
+        target_url = matched.get("url") or f"https://{hostname}"
+        kind = matched.get("kind") or ("platform" if hostname.lower().endswith(".boxliteapp.com") else "custom")
+        box_id = matched.get("boxId")
+        port = matched.get("port")
+        app_id = matched.get("appId")
+
+        if not box_id and not app_id:
+            if kind == "custom":
+                matched["reachable"] = False
+                matched["verificationChecks"] = {"owned": True, "bound": False, "dnsRequired": True}
+                matched["verificationSummary"] = (
+                    f'Custom domain "{hostname}" is registered but unbound. '
+                    "Complete DNS/TLS setup in BoxLite Console -> Domains before binding."
+                )
+            else:
+                matched["reachable"] = False
+                matched["verificationChecks"] = {"owned": True, "bound": False, "dnsRequired": False}
+                matched["verificationSummary"] = (
+                    f'Domain "{hostname}" is owned by your organization and ready (no DNS or TLS setup required). '
+                    "Bind it to a running Box and port with inbound access and a public tunnel to serve traffic."
+                )
+            return matched
+
+        box_status = "unknown"
+        if box_id:
             try:
-                info = await handle.verify(key)
-                return self._format_domain(info)
+                inspected = await self.handle_inspect_box({"boxId": box_id})
+                box_status = extract_box_status(inspected.get("box"))
             except Exception as e:
-                log_debug(f"rt.domains.verify() failed ({e}), falling back to REST")
+                if _is_not_found_error(e):
+                    box_status = "not_found"
 
-        res = await self._rest_fallback(rt).verify_domain(key)
-        return self._format_domain(res)
+        loop = asyncio.get_running_loop()
+        fallback = self._rest_fallback(rt)
+        probe = await loop.run_in_executor(None, fallback.probe_domain_url, target_url, 10)
+        http_status = probe.get("http_status")
+        probe_error = probe.get("error")
+
+        port_label = port if port is not None else "?"
+        if box_status == "not_found":
+            reachable = False
+            summary = (
+                f'Domain "{hostname}" points to Box "{box_id}" (port {port_label}), which no longer exists. '
+                "Bind the domain to another Box or unbind it."
+            )
+        elif http_status is not None and 200 <= http_status < 400:
+            reachable = True
+            summary = f'Domain "{hostname}" is verified and reachable (HTTP {http_status}) -> Box {box_id}:{port_label}.'
+        elif http_status in (401, 403):
+            reachable = True
+            summary = (
+                f'Domain "{hostname}" reached the service on Box {box_id}:{port_label} '
+                f'(HTTP {http_status} application auth).'
+            )
+        elif http_status == 404:
+            reachable = False
+            summary = (
+                f'Domain "{hostname}" returned HTTP 404. Ensure inbound access is enabled and a public tunnel is active '
+                f'for Box {box_id} port {port_label} (private or revoked tunnels do not serve fixed domains).'
+            )
+        elif http_status == 502:
+            reachable = False
+            summary = (
+                f'Domain "{hostname}" returned HTTP 502 (Box unreachable). '
+                f'Ensure the service inside Box {box_id} is running and listening on 0.0.0.0:{port_label}.'
+            )
+        elif http_status == 503:
+            reachable = False
+            summary = (
+                f'Domain "{hostname}" returned HTTP 503 (Box {box_id} status: {box_status}; may be waking on access). '
+                "Retry in a few seconds."
+            )
+        elif http_status is not None:
+            reachable = False
+            summary = f'Domain "{hostname}" responded with HTTP {http_status} (Box {box_id} status: {box_status}).'
+        else:
+            reachable = False
+            summary = f'Could not reach "{target_url}": {probe_error or "connection failed"}.'
+
+        matched["reachable"] = reachable
+        if http_status is not None:
+            matched["httpStatus"] = http_status
+        matched["verificationSummary"] = summary
+        matched["verificationChecks"] = {
+            "owned": True,
+            "bound": True,
+            "dnsRequired": kind == "custom",
+            "boxStatus": box_status,
+            "httpStatus": http_status,
+            "reachable": reachable,
+        }
+        return matched
 
     async def handle_update_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        rt = self.ensure_runtime()
         key = args["domainKey"]
-        box_id = args["boxId"] if "boxId" in args else _UNSET
-        port = args["port"] if "port" in args else _UNSET
+        box_id = args.get("boxId") if "boxId" in args else _UNSET
+        port = args.get("port") if "port" in args else _UNSET
 
-        handle = self._get_domain_handle(rt)
-        if handle is not None and hasattr(handle, "update") and callable(handle.update):
-            try:
-                sdk_kwargs: Dict[str, Any] = {}
-                if box_id is not _UNSET:
-                    sdk_kwargs["box_id"] = box_id
-                if port is not _UNSET:
-                    sdk_kwargs["port"] = port
-                info = await handle.update(key, **sdk_kwargs)
-                return self._format_domain(info)
-            except Exception as e:
-                log_debug(f"rt.domains.update() failed ({e}), falling back to REST")
+        if box_id is None or box_id == "":
+            await self.handle_unbind_domain({"domainKey": key})
+            hostname = key.strip().rstrip(".").lower()
+            return self._format_domain({"hostname": hostname, "url": f"https://{hostname}", "target": None})
 
-        res = await self._rest_fallback(rt).update_domain(key, box_id=box_id, port=port)
-        return self._format_domain(res)
+        return await self.handle_bind_domain({"domainKey": key, "boxId": box_id, "port": port})
 
     async def handle_remove_domain(self, args: Dict[str, Any]) -> Dict[str, Any]:
         rt = self.ensure_runtime()
         key = args["domainKey"]
-
-        handle = self._get_domain_handle(rt)
-        if handle is not None and hasattr(handle, "remove") and callable(handle.remove):
-            try:
-                await handle.remove(key)
-                return {"domainKey": key, "removed": True}
-            except Exception as e:
-                log_debug(f"rt.domains.remove() failed ({e}), falling back to REST")
-
         await self._rest_fallback(rt).remove_domain(key)
         return {"domainKey": key, "removed": True}
 
@@ -2190,6 +2468,26 @@ class BoxLiteBridge:
                     "(no guest NIC provisioned at creation, e.g. Quick Create or Air-Gapped mode). Network policies "
                     "and tunnels cannot be modified after creation — create a new box with Outbound Network enabled."
                 )
+            elif "domain_not_owned" in lower_msg or "does not own" in lower_msg:
+                diagnosis = (
+                    "Domain not owned: reserve the domain first via 'BoxLite: Request Domain...' or BoxLite Console -> Domains, "
+                    "and pass the full hostname (e.g. my-service.boxliteapp.com) with the matching organization API key."
+                )
+            elif "domain_count_limit_reached" in lower_msg:
+                diagnosis = (
+                    "Organization domain allowance reached: unbinding keeps a domain reserved and does not free a slot. "
+                    "Reuse an existing unbound domain or upgrade your plan in BoxLite Console."
+                )
+            elif "subdomain_too_short" in lower_msg:
+                diagnosis = "Platform subdomain is too short: choose a longer subdomain name meeting your organization minimum length."
+            elif "subdomain_taken" in lower_msg:
+                diagnosis = "Platform subdomain is already taken by another organization: choose a different name."
+            elif "region_not_supported" in lower_msg:
+                diagnosis = "Box region is served by a regional proxy and cannot be bound to a platform subdomain."
+            elif "platform_domain_not_configured" in lower_msg:
+                diagnosis = "Platform domains are not configured on this BoxLite Cloud server."
+            elif "domain_not_ready" in lower_msg or "subscription_required" in lower_msg or "subscription_not_ready" in lower_msg:
+                diagnosis = "Custom domain setup or subscription is incomplete: complete setup in BoxLite Console -> Domains."
             elif "502" in message or "unreachable" in lower_msg:
                 diagnosis = "502 Bad Gateway / Box unreachable: Check app listener on 0.0.0.0, /tmp/server.log, network inbound mode, and tunnel declaration (agent.md §5)."
             elif "401" in message or "unauthorized" in message.lower() or ("invalid credentials" in message.lower() and "403" not in message):

@@ -31,10 +31,10 @@ This extension provides a unified developer experience for creating, deploying, 
   - Real-time status for all Boxes (Running, Stopped, Provisioning).
   - Inspect tunnels, active public/private URLs, persistent volumes, and network rules.
   - Direct context menu actions: Start, Stop, Restart, Stream Logs, Exec CLI, Inspect JSON, and Delete.
-- **Custom Domains Explorer (`boxlite.domainsView`):**
-  - Manage custom domains directly from the BoxLite Activity Bar sidebar.
-  - Add custom domains (`Add Domain...`), verify DNS records (`Verify DNS`), and bind domains to Boxes (`Bind Domain to Box...`).
-  - Open verified domains in the browser, copy domain names, inspect domain JSON metadata, and delete domains.
+- **Fixed Public Domains Explorer (`boxlite.domainsView`):**
+  - Manage organization-owned domains (`*.boxliteapp.com` and configured custom domains) directly from the BoxLite Activity Bar sidebar with live quota tracking.
+  - Request platform subdomains (`Request Domain...`), publish & bind domains to Boxes (`Bind Domain to Box...` — automatically enabling inbound access and opening a public port tunnel), and verify domain ownership & HTTPS routing (`Verify Domain`).
+  - Open active domains in the browser, copy domain names, inspect domain JSON metadata, and unbind domains while keeping names reserved (`Unbind Domain`).
 - **Images Menu & Explorer (`boxlite.imagesView`):**
   - Dedicated Images menu positioned directly between **Boxes** and **Volumes** in the BoxLite Activity Bar sidebar.
   - Browse official BoxLite built-in images (`base`, `python`, `node`, `sandbaseai-hermes`), marked free and exempt from organization image quotas.
@@ -260,14 +260,14 @@ Connect directly to any Cloud Box's interactive shell or open a remote VS Code w
 | `boxlite.sshDisable` | Disable SSH & Close Tunnel | Revoke port 22 tunnel and disable SSH on the Box |
 | `boxlite.sshRemoveConfigEntries` | Remove Managed SSH Config Entries | Remove BoxLite-managed blocks from `~/.ssh/config` |
 | `boxlite.inspectBox` | Inspect Box (JSON) | View complete Box state JSON |
-| `boxlite.refreshDomains` | Refresh Domains | Refresh the Custom Domains explorer view |
-| `boxlite.createDomain` | Add Domain... | Register a custom domain in BoxLite Cloud |
-| `boxlite.verifyDomain` | Verify DNS | Trigger DNS verification for a pending/failed domain |
-| `boxlite.bindDomainToBox` | Bind Domain to Box... | Bind a custom domain to a Box |
-| `boxlite.openDomainUrl` | Open Domain in Browser | Open an active/verified custom domain in the browser |
-| `boxlite.copyDomainName` | Copy Domain Name | Copy custom domain name to clipboard |
-| `boxlite.inspectDomain` | Inspect Domain (JSON) | View custom domain state and metadata JSON |
-| `boxlite.deleteDomain` | Delete Domain | Delete a custom domain |
+| `boxlite.refreshDomains` | Refresh Domains | Refresh the Domains explorer view |
+| `boxlite.createDomain` | Request Domain... | Claim a platform subdomain (`*.boxliteapp.com`) in BoxLite Cloud |
+| `boxlite.verifyDomain` | Verify Domain | Verify domain ownership, box state, and live HTTPS reachability |
+| `boxlite.bindDomainToBox` | Bind Domain to Box... | Enable inbound access, open a public tunnel, and bind a domain to a Box |
+| `boxlite.openDomainUrl` | Open Domain in Browser | Open a bound domain in the browser |
+| `boxlite.copyDomainName` | Copy Domain Name | Copy domain hostname to clipboard |
+| `boxlite.inspectDomain` | Inspect Domain (JSON) | View domain state and allowance metadata JSON |
+| `boxlite.unbindDomain` | Unbind Domain | Stop routing traffic while keeping the hostname reserved |
 | `boxlite.refreshImages` | Refresh Images | Refresh the Images catalog and explorer view |
 | `boxlite.addImage` | Use Your Own Image... | Add custom image reference or boot microVM from registry |
 | `boxlite.createBoxFromImage` | Create Box from Image... | Launch a new Box preconfigured with selected image |

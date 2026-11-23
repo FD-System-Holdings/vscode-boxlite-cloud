@@ -24,7 +24,9 @@ import {
   CheckpointItem,
   CreateCheckpointArgs,
   DomainItem,
+  DomainListResult,
   CreateDomainArgs,
+  BindDomainArgs,
   UpdateDomainArgs,
   VerifySecretInjectionArgs,
   VerifySecretInjectionResult
@@ -446,15 +448,31 @@ export class BoxLiteBridgeClient implements vscode.Disposable {
   }
 
   // Domain Operations
-  public async listDomains(): Promise<DomainItem[]> {
+  public async listDomainsWithAllowance(): Promise<DomainListResult> {
     return this.coalesceRead('list_domains', async () => {
-      const res = await this.sendRequest<{ domains: DomainItem[] }>('list_domains', {}, 20000);
-      return res.domains || [];
+      const res = await this.sendRequest<DomainListResult>('list_domains', {}, 20000);
+      return {
+        domains: res.domains || [],
+        allowance: res.allowance
+      };
     });
+  }
+
+  public async listDomains(): Promise<DomainItem[]> {
+    const res = await this.listDomainsWithAllowance();
+    return res.domains || [];
   }
 
   public async createDomain(args: CreateDomainArgs): Promise<DomainItem> {
     return this.sendRequest<DomainItem>('create_domain', args, 30000);
+  }
+
+  public async bindDomain(args: BindDomainArgs): Promise<DomainItem> {
+    return this.sendRequest<DomainItem>('bind_domain', args, 30000);
+  }
+
+  public async unbindDomain(domainKey: string): Promise<{ domainKey: string; unbound: boolean }> {
+    return this.sendRequest<{ domainKey: string; unbound: boolean }>('unbind_domain', { domainKey }, 30000);
   }
 
   public async inspectDomain(domainKey: string): Promise<any> {

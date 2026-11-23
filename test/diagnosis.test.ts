@@ -105,4 +105,36 @@ describe('Error Diagnostics (§5 Table Mapping)', () => {
     assert.strictEqual(diag.checklist.some((item) => item.includes('10 GB')), true);
     assert.strictEqual(diag.checklist.some((item) => item.includes('auto_remove')), false);
   });
+
+  it('should diagnose BoxLite Cloud domain error codes accurately', () => {
+    assert.strictEqual(
+      diagnoseError('BoxLite Cloud API error (404) [domain_not_owned]: This organization does not own foo.boxliteapp.com.')
+        .summary,
+      'Domain Not Owned by Organization'
+    );
+    assert.strictEqual(
+      diagnoseError('BoxLite Cloud API error (400) [domain_count_limit_reached]: Limit reached').summary,
+      'Organization Domain Allowance Reached'
+    );
+    assert.strictEqual(
+      diagnoseError('BoxLite Cloud API error (400) [subdomain_too_short]: Too short').summary,
+      'Platform Subdomain Too Short'
+    );
+    assert.strictEqual(
+      diagnoseError('BoxLite Cloud API error (409) [subdomain_taken]: Taken').summary,
+      'Platform Subdomain Already Taken'
+    );
+    assert.strictEqual(
+      diagnoseError('BoxLite Cloud API error (400) [region_not_supported]: Unsupported region').summary,
+      'Region Not Supported for Platform Subdomain'
+    );
+    assert.strictEqual(
+      diagnoseError('BoxLite Cloud API error (400) [platform_domain_not_configured]: Not configured').summary,
+      'Platform Domains Not Configured on Server'
+    );
+    assert.strictEqual(
+      diagnoseError('BoxLite Cloud API error (409) [domain_not_ready]: Complete custom domain setup').summary,
+      'Custom Domain Setup or Subscription Incomplete'
+    );
+  });
 });

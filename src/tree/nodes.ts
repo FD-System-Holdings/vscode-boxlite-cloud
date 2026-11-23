@@ -7,7 +7,8 @@ import {
   ImageUsage,
   CheckpointItem,
   SecretConfigSpec,
-  DomainItem
+  DomainItem,
+  DomainAllowance
 } from '../bridge/protocol';
 
 export abstract class BoxLiteTreeItem extends vscode.TreeItem {
@@ -459,6 +460,23 @@ export class SecretChildTreeItem extends BoxLiteTreeItem {
   }
 }
 
+export class DomainAllowanceTreeItem extends BoxLiteTreeItem {
+  constructor(public readonly allowance: DomainAllowance) {
+    const label = `${allowance.used} of ${allowance.limit} platform ${allowance.limit === 1 ? 'domain' : 'domains'}`;
+    super(label, vscode.TreeItemCollapsibleState.None);
+    this.description = allowance.remaining <= 0 ? 'Limit reached' : `${allowance.remaining} remaining`;
+    this.iconPath = new vscode.ThemeIcon(
+      allowance.remaining <= 0 ? 'warning' : 'globe',
+      allowance.remaining <= 0 ? new vscode.ThemeColor('charts.yellow') : undefined
+    );
+    const suffixNote = allowance.domainSuffix ? `\nPlatform Suffix: *.${allowance.domainSuffix}` : '';
+    this.tooltip =
+      `BoxLite Cloud Platform Domain Allowance:\n${allowance.used} of ${allowance.limit} platform domains reserved (${allowance.remaining} remaining).` +
+      `${suffixNote}\nMinimum subdomain length: ${allowance.minLength} characters.\n\nNote: Unbinding a domain keeps the hostname reserved and does not free a quota slot.`;
+    this.contextValue = 'domain-allowance-item';
+  }
+}
+
 export class DomainTreeItem extends BoxLiteTreeItem {
   public readonly domain: DomainItem;
 
@@ -467,15 +485,26 @@ export class DomainTreeItem extends BoxLiteTreeItem {
     super(label, vscode.TreeItemCollapsibleState.Collapsed);
     this.domain = domain;
 
-    const status = (domain.status || 'pending').toLowerCase().trim();
-    const targetLabel = domain.boxName || domain.boxId;
+    const hasTarget = Boolean(domain.boxId || domain.appId);
+    const rawStatus = (domain.status || '').toLowerCase().trim();
+    const status = rawStatus || (hasTarget ? 'active' : 'unbound');
+    const targetLabel = domain.boxName || domain.boxId || domain.appId;
     const portSuffix = domain.port ? `:${domain.port}` : '';
-    const targetDesc = targetLabel ? `→ ${targetLabel}${portSuffix}` : 'unattached';
+    const isCustom = domain.kind === 'custom';
+    const targetDesc = targetLabel
+      ? `→ ${targetLabel}${portSuffix}`
+      : status === 'unbound'
+        ? isCustom
+          ? 'custom'
+          : 'reserved'
+        : 'unattached';
 
     this.description = `${status} · ${targetDesc}`;
 
     if (status === 'active' || status === 'verified' || status === 'ready') {
       this.iconPath = new vscode.ThemeIcon('globe', new vscode.ThemeColor('charts.green'));
+    } else if (status === 'unbound') {
+      this.iconPath = new vscode.ThemeIcon('globe');
     } else if (status === 'pending' || status === 'verifying' || status === 'provisioning') {
       this.iconPath = new vscode.ThemeIcon('sync~spin', new vscode.ThemeColor('charts.yellow'));
     } else if (status === 'deleting') {
@@ -491,6 +520,12 @@ export class DomainTreeItem extends BoxLiteTreeItem {
       `Status: ${status}`,
       `Target: ${targetLabel ? `${targetLabel}${portSuffix}` : 'Not bound to a Box'}`
     ];
+    if (domain.kind) {
+      lines.push(`Kind: ${isCustom ? 'Custom domain' : 'Platform (*.boxliteapp.com)'}`);
+    }
+    if (domain.url) {
+      lines.push(`URL: ${domain.url}`);
+    }
     if (domain.tlsStatus) {
       lines.push(`TLS: ${domain.tlsStatus}`);
     }

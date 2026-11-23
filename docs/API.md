@@ -750,67 +750,58 @@ Invoke-BoxLiteApi -Method DELETE -Path "/checkpoints/$encodedKey?force=true" | O
 
 ---
 
-## 11. Custom Domains API
+## 11. Fixed Public Domains API
 
-Register custom FQDNs, verify DNS ownership, and bind/unbind domains to a box and port.
+Reserve platform subdomains (`*.boxliteapp.com`), inspect organization domain allowance, and bind/unbind owned hostnames to a Box and port.
 
 ### Endpoints
 
 | Operation | Method & Path | Bridge Op | Notes |
 |---|---|---|---|
-| List domains | `GET /v1/domains` | `list_domains` | Paginated via `?pageToken=...` using `next_page_token` / `nextPageToken`. |
-| Create domain | `POST /v1/domains` | `create_domain` | Body: `{ "domain": "app.example.com", "box_id"?: "...", "port"?: 8080 }`. |
-| Inspect domain | `GET /v1/domains/{encoded_key}` | `inspect_domain` | Returns status, DNS verification record, `cname_target`, `tls_status`. |
-| Verify DNS | `POST /v1/domains/{encoded_key}/verify` | `verify_domain` | Body: `{}`. Triggers DNS verification check. |
-| Update binding | `PATCH /v1/domains/{encoded_key}` | `update_domain` | Body: `{ "box_id": "..." \| null, "port": 8080 }`. |
-| Remove domain | `DELETE /v1/domains/{encoded_key}` | `remove_domain` | Deletes the custom domain. |
+| List held domains & allowance | `GET /v1/domains` | `list_domains` | Returns `{ domains: [{ hostname, url, target, kind }], limit, used, remaining, min_length, domain_suffix }`. |
+| Claim platform subdomain | `POST /v1/domains` | `create_domain` | Body: `{ "name": "my-service" }` (short label only, `forbidNonWhitelisted`). Returns `201`. |
+| Bind domain to Box port | `PUT /v1/domains/{domain}/target` | `bind_domain` | Path `{domain}` is the owned full hostname; Body: `{ "type": "box", "box": "<id_or_name>", "port": 8080 }`. |
+| Unbind domain | `DELETE /v1/domains/{domain}/target` | `unbind_domain` | Stops routing traffic (`204 No Content`) while keeping the hostname reserved in org quota. |
+
+> **Publishing Requirement:** Binding a domain alone does not expose a service. All three steps are required: (1) enable inbound access (`PUT /v1/boxes/{id}/network/inbound`), (2) create a public tunnel (`POST /v1/boxes/{id}/network/tunnel?port={port}`), and (3) bind the owned domain (`PUT /v1/domains/{domain}/target`). Platform subdomains (`*.boxliteapp.com`) do not require manual DNS or TLS setup.
 
 ### Validation Rules (`src/util/validation.ts`)
 
-- Must be a valid FQDN (e.g., `app.example.com`). Wildcards (`*.example.com`), schemes, ports, paths, and IP addresses are rejected.
+- `validatePlatformSubdomain`: Accepts a short lowercase alphanumeric/hyphen label (`1..63` chars, meeting `min_length`), strips `.<domain_suffix>` if pasted, and rejects reserved labels (`api`, `app`, `boxes`, `domains`, etc.) and legacy `<digits>-` prefixes.
 
 ### PowerShell Examples
 
 ```powershell
-# 1. Register a custom domain (optionally bound to a box & port immediately)
-$dom = Invoke-BoxLiteApi -Method POST -Path "/domains" -Body @{
-    domain = "app.example.com"
-    box_id = "your-box-id"
-    port   = 8080
+# 1. List held domains and check organization allowance
+$held = Invoke-BoxLiteApi -Method GET -Path "/domains"
+$held.domains | Select-Object hostname, kind, url, target | Format-Table -AutoSize
+Write-Host "Quota: $($held.used)/$($held.limit) ($($held.remaining) remaining, min_length=$($held.min_length), suffix=$($held.domain_suffix))"
+
+# 2. Claim a platform subdomain (short label only)
+$claimed = Invoke-BoxLiteApi -Method POST -Path "/domains" -Body @{
+    name = "my-service"
 }
-$domKey = if ($dom.id) { $dom.id } else { $dom.domain }
-Write-Host "Add DNS record: $($dom.verification_record_name) -> $($dom.verification_record_value)"
-Write-Host "CNAME target:   $($dom.cname_target)"
+$domain = $claimed.hostname
 
-# 2. List all domains (handling pagination)
-$allDomains = @()
-$pageToken = $null
-do {
-    $path = if ($pageToken) {
-        "/domains?pageToken=$([System.Uri]::EscapeDataString($pageToken))"
-    } else {
-        "/domains"
-    }
-    $page = Invoke-BoxLiteApi -Method GET -Path $path
-    $items = if ($page.domains) { $page.domains } else { $page.items }
-    if ($items) { $allDomains += $items }
-    $pageToken = if ($page.next_page_token) { $page.next_page_token } else { $page.nextPageToken }
-} while ($pageToken)
-$allDomains | Select-Object id, domain, status, box_id, port, tls_status | Format-Table -AutoSize
+# 3. Publish box port (inbound + public tunnel) and bind the domain
+$boxId = "your-box-id"
+$port  = 8080
+Invoke-BoxLiteApi -Method PUT  -Path "/boxes/$boxId/network/inbound" -Body @{ mode = "enabled" } | Out-Null
+Invoke-BoxLiteApi -Method POST -Path "/boxes/$boxId/network/tunnel?port=$port" | Out-Null
 
-# 3. Trigger DNS verification
-$encodedDom = [System.Uri]::EscapeDataString($domKey)
-Invoke-BoxLiteApi -Method POST -Path "/domains/$encodedDom/verify" -Body @{}
-
-# 4. Rebind domain to a different box/port (or pass $null to unbind)
-Invoke-BoxLiteApi -Method PATCH -Path "/domains/$encodedDom" -Body @{
-    box_id = "other-box-id"
-    port   = 3000
+$encodedDomain = [System.Uri]::EscapeDataString($domain)
+Invoke-BoxLiteApi -Method PUT -Path "/domains/$encodedDomain/target" -Body @{
+    type = "box"
+    box  = $boxId
+    port = $port
 }
 
-# 5. Inspect & Delete domain
-Invoke-BoxLiteApi -Method GET -Path "/domains/$encodedDom"
-Invoke-BoxLiteApi -Method DELETE -Path "/domains/$encodedDom" | Out-Null
+# 4. Probe the fixed public URL (skipping preview interstitial for scripts)
+Invoke-WebRequest -Uri "https://$domain/" -Headers @{ "X-BoxLite-Skip-Preview-Warning" = "true" }
+
+# 5. Unbind domain (keeps hostname reserved; optionally revoke the port tunnel separately)
+Invoke-BoxLiteApi -Method DELETE -Path "/domains/$encodedDomain/target" | Out-Null
+Invoke-BoxLiteApi -Method DELETE -Path "/boxes/$boxId/network/tunnel?port=$port" | Out-Null
 ```
 
 ---
@@ -846,7 +837,7 @@ If you want to call the extension's Python sidecar (`src/bridge/python/bridge.py
 - **Images:** `list_images`, `inspect_image`, `remove_image`, `create_image_alias`, `delete_image_alias`, `create_registry_login`
 - **Checkpoints:** `list_checkpoints`, `create_checkpoint`, `inspect_checkpoint`, `remove_checkpoint`
 - **Secrets:** `verify_secret_injection`
-- **Domains:** `list_domains`, `create_domain`, `inspect_domain`, `verify_domain`, `update_domain`, `remove_domain`
+- **Domains:** `list_domains`, `create_domain`, `bind_domain`, `unbind_domain`, `inspect_domain`, `verify_domain`, `update_domain`
 
 ### PowerShell Example: Calling `bridge.py` Directly
 

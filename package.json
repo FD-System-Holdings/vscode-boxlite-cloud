@@ -486,15 +486,15 @@
       },
       {
         "command": "boxlite.createDomain",
-        "title": "Add Domain...",
+        "title": "Request Domain...",
         "category": "BoxLite",
         "icon": "$(add)"
       },
       {
         "command": "boxlite.verifyDomain",
-        "title": "Verify DNS",
+        "title": "Verify Domain",
         "category": "BoxLite",
-        "icon": "$(check)"
+        "icon": "$(pulse)"
       },
       {
         "command": "boxlite.bindDomainToBox",
@@ -521,10 +521,10 @@
         "icon": "$(json)"
       },
       {
-        "command": "boxlite.deleteDomain",
-        "title": "Delete Domain",
+        "command": "boxlite.unbindDomain",
+        "title": "Unbind Domain",
         "category": "BoxLite",
-        "icon": "$(trash)"
+        "icon": "$(debug-disconnect)"
       }
     ],
     "menus": {
@@ -657,13 +657,18 @@
           "group": "9_danger@1"
         },
         {
-          "command": "boxlite.verifyDomain",
-          "when": "view == boxlite.domainsView && viewItem =~ /^domain-(pending|failed|error)$/",
+          "command": "boxlite.openDomainUrl",
+          "when": "view == boxlite.domainsView && viewItem == 'domain-active'",
           "group": "inline@1"
         },
         {
           "command": "boxlite.bindDomainToBox",
-          "when": "view == boxlite.domainsView && viewItem =~ /^domain-(?!deleting)/",
+          "when": "view == boxlite.domainsView && viewItem == 'domain-unbound'",
+          "group": "inline@1"
+        },
+        {
+          "command": "boxlite.bindDomainToBox",
+          "when": "view == boxlite.domainsView && viewItem =~ /^domain-(active|unbound|verified|ready|pending|verifying|provisioning|failed|error)$/",
           "group": "1_manage@1"
         },
         {
@@ -673,22 +678,22 @@
         },
         {
           "command": "boxlite.verifyDomain",
-          "when": "view == boxlite.domainsView && viewItem =~ /^domain-(pending|failed|error)$/",
+          "when": "view == boxlite.domainsView && viewItem =~ /^domain-(active|unbound|verified|ready|pending|failed|error)$/",
           "group": "1_manage@3"
         },
         {
           "command": "boxlite.copyDomainName",
-          "when": "view == boxlite.domainsView && viewItem =~ /^domain-/",
+          "when": "view == boxlite.domainsView && viewItem =~ /^domain-(active|unbound|verified|ready|pending|verifying|provisioning|failed|error|deleting)$/",
           "group": "2_copy@1"
         },
         {
           "command": "boxlite.inspectDomain",
-          "when": "view == boxlite.domainsView && viewItem =~ /^domain-/",
+          "when": "view == boxlite.domainsView && viewItem =~ /^domain-(active|unbound|verified|ready|pending|verifying|provisioning|failed|error|deleting)$/",
           "group": "3_inspect@1"
         },
         {
-          "command": "boxlite.deleteDomain",
-          "when": "view == boxlite.domainsView && viewItem =~ /^domain-(?!deleting)/",
+          "command": "boxlite.unbindDomain",
+          "when": "view == boxlite.domainsView && viewItem == 'domain-active'",
           "group": "9_danger@1"
         },
         {
