@@ -582,6 +582,35 @@ class TestBoxLiteBridge(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(captured[0][1])
             self.assertIn(expected.lower(), captured[0][2]["diagnosis"].lower())
 
+    async def test_security_hardening_rest_url_volume_encoding_and_verify_host(self):
+        # 1. Non-loopback http:// must be rejected to protect API keys
+        with self.assertRaises(ValueError):
+            bridge.RestRuntimeFallback("http://api.boxlite.ai", "bl_test_key")
+        # Loopback http:// and https:// are allowed
+        rt_local = bridge.RestRuntimeFallback("http://127.0.0.1:8080", "bl_test_key")
+        self.assertEqual(rt_local.rest_url, "http://127.0.0.1:8080")
+        rt_https = bridge.RestRuntimeFallback("https://api.boxlite.ai/", "bl_test_key")
+        self.assertEqual(rt_https.rest_url, "https://api.boxlite.ai")
+
+        # 2. volume_id must be URL-encoded in get_volume and remove_volume
+        called_paths = []
+
+        def fake_request(method, req_path, body=None, timeout=30):
+            called_paths.append((method, req_path))
+            return {}
+
+        rt_https._request = fake_request
+        await rt_https.get_volume("../boxes/abc")
+        await rt_https.remove_volume("vol/1?force=false#x", force=True)
+        self.assertEqual(called_paths[0], ("GET", "/volumes/..%2Fboxes%2Fabc"))
+        self.assertEqual(called_paths[1], ("DELETE", "/volumes/vol%2F1%3Fforce%3Dfalse%23x?force=true"))
+
+        # 3. verify_secret_injection rejects malicious host injection
+        br = bridge.BoxLiteBridge()
+        br.rt = rt_https
+        with self.assertRaises(ValueError):
+            await br.handle_verify_secret_injection({"host": 'httpbingo.org"); import os; #'})
+
 
 if __name__ == "__main__":
     unittest.main()

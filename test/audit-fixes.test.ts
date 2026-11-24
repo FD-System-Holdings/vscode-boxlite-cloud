@@ -1,20 +1,26 @@
 import * as assert from 'assert';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { showBoxConfigurationWizard } from '../src/commands/boxConfiguration';
 import { CredentialsManager } from '../src/auth/credentials';
 import { SecretsManager } from '../src/auth/secretsStore';
 import { PythonEnvManager } from '../src/bridge/env';
 import { BoxLiteBridgeClient } from '../src/bridge/client';
+import { AccountTreeDataProvider } from '../src/tree/accountProvider';
 import { BoxesTreeDataProvider } from '../src/tree/boxesProvider';
 import { VolumesTreeDataProvider } from '../src/tree/volumesProvider';
+import { ImagesTreeDataProvider } from '../src/tree/imagesProvider';
 import { CheckpointsTreeDataProvider } from '../src/tree/checkpointsProvider';
 import { DomainsTreeDataProvider } from '../src/tree/domainsProvider';
 import { SecretsTreeDataProvider } from '../src/tree/secretsProvider';
 import { LogStreamManager } from '../src/logs/logStream';
-import { SshService, SshStore, SshCliError } from '../src/ssh';
+import { SshService, SshStore, SshCliError, ensureBoxKeyBundle, removeBoxKeyBundle } from '../src/ssh';
 import { removeAllManagedBlocks } from '../src/ssh/sshConfig';
 import { formatErrorWithDiagnosis } from '../src/util/diagnosis';
 import { createErrorTreeItem, VolumeChildTreeItem } from '../src/tree/nodes';
+import { BoxLiteDeployer, buildHealthProbeCommand, isPathWithinRoot, stageAppDirectory } from '../src/deploy/deployer';
 
 describe('Audit Regression Fixes', () => {
   describe('1. Wizard invalid secret validation', () => {
@@ -449,6 +455,151 @@ describe('Audit Regression Fixes', () => {
       assert.ok(res.content.includes('Host work'));
       assert.ok(!res.content.includes('boxlite-box1'));
       assert.ok(!res.content.includes('boxlite-box2'));
+    });
+  });
+
+  describe('Security & Audit Round 2 fixes', () => {
+    it('restricts sensitive settings in package.json to application scope', () => {
+      const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8'));
+      const props = pkg.contributes.configuration.properties;
+      for (const key of [
+        'boxlite.restUrl',
+        'boxlite.pythonPath',
+        'boxlite.ssh.cliPath',
+        'boxlite.ssh.sshPath',
+        'boxlite.ssh.manageConfig'
+      ]) {
+        assert.strictEqual(props[key].scope, 'application', `${key} must have scope: "application"`);
+      }
+    });
+
+    it('rejects appDir path traversal and skips escaping symlinks during staging', () => {
+      const wsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-ws-sec-'));
+      const outsideFile = path.join(os.tmpdir(), `boxlite-outside-${Date.now()}.txt`);
+      fs.writeFileSync(outsideFile, 'TOP_SECRET');
+      try {
+        assert.strictEqual(isPathWithinRoot(wsRoot, path.join(wsRoot, 'app')), true);
+        assert.strictEqual(isPathWithinRoot(wsRoot, path.resolve(wsRoot, '../outside')), false);
+
+        const appDir = path.join(wsRoot, 'app');
+        fs.mkdirSync(appDir, { recursive: true });
+        fs.writeFileSync(path.join(appDir, 'server.py'), 'print("ok")');
+        let symlinkCreated = false;
+        try {
+          fs.symlinkSync(outsideFile, path.join(appDir, 'leak.txt'));
+          symlinkCreated = true;
+        } catch {
+          // Windows without Developer Mode may disallow symlink creation
+        }
+
+        const staged = stageAppDirectory(appDir, []);
+        try {
+          assert.strictEqual(fs.existsSync(path.join(staged, 'server.py')), true);
+          if (symlinkCreated) {
+            assert.strictEqual(fs.existsSync(path.join(staged, 'leak.txt')), false, 'Escaping symlink must not be staged');
+          }
+        } finally {
+          fs.rmSync(staged, { recursive: true, force: true });
+        }
+      } finally {
+        fs.rmSync(wsRoot, { recursive: true, force: true });
+        fs.rmSync(outsideFile, { force: true });
+      }
+    });
+
+    it('prevents double-quote shell injection in buildHealthProbeCommand and validates port', () => {
+      assert.throws(() => buildHealthProbeCommand(0, '/healthz'), /Invalid health probe port/);
+      assert.throws(() => buildHealthProbeCommand(8080, '/healthz\nwhoami'), /control characters/);
+
+      const malicious = '/healthz"; id; echo "$(whoami)"';
+      const cmd = buildHealthProbeCommand(8080, malicious);
+      // URL is passed via single-quoted env var, and python3/node scripts are single-quoted reading env
+      assert.ok(cmd.includes("BOXLITE_HEALTH_URL='http://127.0.0.1:8080/healthz\"; id; echo \"$(whoami)\"'"));
+      assert.ok(cmd.includes('os.environ["BOXLITE_HEALTH_URL"]'));
+      assert.ok(cmd.includes('process.env.BOXLITE_HEALTH_URL'));
+    });
+
+    it('rejects path traversal boxId in ensureBoxKeyBundle and removeBoxKeyBundle', () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-key-sec-'));
+      try {
+        assert.throws(() => ensureBoxKeyBundle(tmp, 'scope', '../escape'), /Invalid Box ID/);
+        assert.throws(() => removeBoxKeyBundle(tmp, 'scope', '../../escape'), /Invalid Box ID/);
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('redacts private access token in deploy output channel', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxlite-token-redact-'));
+      const appDir = path.join(tmpDir, 'app');
+      fs.mkdirSync(appDir, { recursive: true });
+      fs.writeFileSync(path.join(appDir, 'server.py'), 'print("ok")');
+      fs.writeFileSync(
+        path.join(tmpDir, 'boxlite.json'),
+        JSON.stringify({ name: 'priv-app', appDir: './app', port: 8080, healthPath: '/healthz', start: 'python3 -u server.py', access: 'private' })
+      );
+
+      const origFolders = vscode.workspace.workspaceFolders;
+      const origShowInfo = vscode.window.showInformationMessage;
+      (vscode.workspace as any).workspaceFolders = [{ uri: vscode.Uri.file(tmpDir), name: 'ws', index: 0 }];
+      (vscode.window as any).showInformationMessage = async () => undefined;
+
+      const lines: string[] = [];
+      const mockChannel = {
+        name: 'test',
+        append: (v: string) => lines.push(v),
+        appendLine: (v: string) => lines.push(v),
+        replace: () => {},
+        clear: () => {},
+        show: () => {},
+        hide: () => {},
+        dispose: () => {}
+      } as unknown as vscode.OutputChannel;
+
+      const secretToken = 'tok_super_secret_private_value_9999';
+      const mockBridge = {
+        createBox: async () => ({ boxId: 'box-priv', name: 'priv-app', status: 'running' }),
+        exec: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+        copyIn: async () => true,
+        updateInbound: async () => {},
+        tunnel: async () => ({ url: 'https://priv.boxlite.ai', token: secretToken, isPublic: false, boxId: 'box-priv', port: 8080 })
+      } as unknown as BoxLiteBridgeClient;
+
+      try {
+        const deployer = new BoxLiteDeployer(
+          mockBridge,
+          { getApiKey: async () => 'bl_live_key' } as unknown as CredentialsManager,
+          { openOrStreamLogs: async () => {} } as unknown as LogStreamManager,
+          mockChannel,
+          undefined,
+          undefined,
+          0,
+          async () => 200
+        );
+        await deployer.deployWorkspace();
+        const combined = lines.join('\n');
+        assert.strictEqual(combined.includes(secretToken), false, 'Raw private tunnel token must not be written to output channel');
+        assert.ok(combined.includes('tok_...9999'), 'Redacted token should be logged');
+      } finally {
+        (vscode.workspace as any).workspaceFolders = origFolders;
+        (vscode.window as any).showInformationMessage = origShowInfo;
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('implements dispose() on Account, Images, and Secrets tree providers', () => {
+      const creds = { getApiKey: async () => undefined } as unknown as CredentialsManager;
+      const bridge = {} as unknown as BoxLiteBridgeClient;
+      const secretsMgr = {} as unknown as SecretsManager;
+      const providers = [
+        new AccountTreeDataProvider(creds),
+        new ImagesTreeDataProvider(bridge, creds),
+        new SecretsTreeDataProvider(bridge, creds, secretsMgr)
+      ];
+      for (const p of providers) {
+        assert.strictEqual(typeof p.dispose, 'function');
+        p.dispose();
+      }
     });
   });
 });

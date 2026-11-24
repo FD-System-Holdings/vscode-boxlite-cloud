@@ -2457,7 +2457,7 @@ export function registerCommands(
             'Open in Browser'
           );
           if (openBtn === 'Open in Browser') {
-            await vscode.env.openExternal(vscode.Uri.parse(targetUrl));
+            await openExternalHttpUrl(targetUrl);
           }
         } else {
           vscode.window.showInformationMessage(
@@ -2501,7 +2501,7 @@ export function registerCommands(
         } else if (updated.reachable === true) {
           const action = await vscode.window.showInformationMessage(summary, 'Open in Browser');
           if (action === 'Open in Browser') {
-            await vscode.env.openExternal(vscode.Uri.parse(updated.url || `https://${updated.domain}`));
+            await openExternalHttpUrl(updated.url || `https://${updated.domain}`);
           }
         } else if (updated.httpStatus === 404 && updated.boxId && updated.port) {
           const action = await vscode.window.showWarningMessage(
@@ -2536,7 +2536,13 @@ export function registerCommands(
       const dom = await resolveDomain(item, bridge);
       if (!dom) return;
 
-      const boxes = await bridge.listBoxes();
+      let boxes;
+      try {
+        boxes = await bridge.listBoxes();
+      } catch (e: any) {
+        vscode.window.showErrorMessage(`Failed to list boxes: ${formatErrorWithDiagnosis(e)}`);
+        return;
+      }
       const picks: Array<vscode.QuickPickItem & { boxId: string | null }> = [
         ...boxes.map((b) => ({
           label: b.name || b.id,
@@ -2637,7 +2643,7 @@ export function registerCommands(
           'Open in Browser'
         );
         if (openBtn === 'Open in Browser') {
-          await vscode.env.openExternal(vscode.Uri.parse(targetUrl));
+          await openExternalHttpUrl(targetUrl);
         }
       } catch (e: any) {
         const msg = formatErrorWithDiagnosis(e);
@@ -2665,7 +2671,7 @@ export function registerCommands(
           return;
         }
       }
-      await vscode.env.openExternal(vscode.Uri.parse(targetUrl));
+      await openExternalHttpUrl(targetUrl);
     })
   );
 
@@ -2859,7 +2865,13 @@ async function resolveDomain(
     return item.domain;
   }
   const key = typeof item === 'string' ? item.trim().replace(/\.+$/, '').toLowerCase() : undefined;
-  const domains = await bridge.listDomains();
+  let domains: DomainItem[];
+  try {
+    domains = await bridge.listDomains();
+  } catch (e: any) {
+    vscode.window.showErrorMessage(`Failed to list domains: ${formatErrorWithDiagnosis(e)}`);
+    return undefined;
+  }
   if (key) {
     return (
       domains.find(
