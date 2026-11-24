@@ -120,7 +120,9 @@ export function formatManagedBlock(spec: SshHostBlockSpec, eol = '\n'): string {
     `  HostName ${spec.hostName}`,
     `  User ${user}`,
     `  IdentityFile ${formatConfigPathValue(spec.identityFile)}`,
-    '  IdentitiesOnly yes'
+    '  IdentitiesOnly yes',
+    '  ServerAliveInterval 15',
+    '  ServerAliveCountMax 3'
   ];
 
   if (spec.port && spec.port !== '22') {

@@ -1133,6 +1133,7 @@ describe('Cloud SSH Access', () => {
           assert.ok(termArgs.includes('StrictHostKeyChecking=yes'));
           assert.ok(termArgs.some((a) => a.startsWith('HostKeyAlias=boxlite-box_sdk')));
           assert.strictEqual(termArgs[termArgs.length - 1], 'box@127.0.0.1');
+          assert.ok(termArgs.includes('ServerAliveInterval=15'));
 
           // Reconnect after terminal close & server-side disable -> calls enableSsh without reconfiguring
           createdTerminals[0].dispose();
@@ -1152,6 +1153,31 @@ describe('Cloud SSH Access', () => {
           assert.ok(
             executedCmds.some((c) => c.id === 'opensshremotes.openEmptyWindow' && c.args[0]?.host === 'boxlite-sdk-box')
           );
+
+          // transport "proxy-command" also routes the integrated terminal through the broker
+          // (no unauthenticated loopback forwarder) and keeps keepalives on the session
+          {
+            const origCfg = vscode.workspace.getConfiguration;
+            (vscode.workspace as any).getConfiguration = () => ({
+              get: (k: string, def: any) => (k === 'ssh.transport' ? 'proxy-command' : def),
+              update: async () => {}
+            });
+            try {
+              for (const t of [...createdTerminals]) t.dispose();
+              (svc as any).activeTerminals.clear();
+              const before = createdTerminals.length;
+              await svc.connect('box_sdk', 'sdk-box');
+              assert.strictEqual(createdTerminals.length, before + 1);
+              const proxyArgs: string[] = createdTerminals[createdTerminals.length - 1].creationOptions.shellArgs;
+              assert.ok(!proxyArgs.includes('-p'), 'proxy-command terminal must not use the loopback forwarder port');
+              assert.ok(proxyArgs.some((a) => a.startsWith('ProxyCommand=') && a.includes('--broker')));
+              assert.ok(proxyArgs.includes('ServerAliveInterval=15'));
+              assert.ok(proxyArgs.includes('StrictHostKeyChecking=yes'));
+              assert.strictEqual(proxyArgs[proxyArgs.length - 1], 'box@boxlite-box_sdk');
+            } finally {
+              (vscode.workspace as any).getConfiguration = origCfg;
+            }
+          }
 
           // Disable revokes tunnel before disabling guest SSH and cleans up
           await svc.disable('box_sdk', 'sdk-box');

@@ -10,7 +10,7 @@ This extension provides a unified developer experience for creating, deploying, 
 
 ## Key Features
 
-- **1-Click Deploy ("Deploy to Box"):** Deployment Pipleline:
+- **1-Click Deploy ("Deploy to Box"):** Deployment Pipeline:
   - Automates supervisor loops (`PID 1` foreground lifecycle) to prevent premature container exits.
   - Verifies local guest health (`/healthz` on `0.0.0.0:8080`).
   - Establishes private tunnels.
