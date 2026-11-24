@@ -43,6 +43,9 @@ const REMOTE_SSH_EXTENSION_ID = 'ms-vscode-remote.remote-ssh';
 const OPEN_REMOTE_SSH_EXTENSION_ID = 'jeanp413.open-remote-ssh';
 
 export type SshMode = 'sdk' | 'cli';
+/** Detect dead Cloud tunnels (box stopped, tunnel revoked) instead of hanging the session. */
+const SSH_KEEPALIVE_ARGS = ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3'];
+
 export type SshTransport = 'auto' | 'forwarder' | 'proxy-command';
 
 export interface SshSettings {
@@ -585,7 +588,28 @@ export class SshService implements vscode.Disposable {
       `UserKnownHostsFile=${knownHostsPath}`,
       '-o',
       `HostKeyAlias=${hostKeyAlias}`,
+      ...SSH_KEEPALIVE_ARGS,
       `${loginUser}@127.0.0.1`
+    ];
+  }
+
+  /** OpenSSH args that reach the box through the secret-authenticated broker via ProxyCommand. */
+  private buildSdkProxyArgs(stored: StoredSshConfig, proxyCmd: string): string[] {
+    return [
+      '-i',
+      stored.keyPath,
+      '-o',
+      'IdentitiesOnly=yes',
+      '-o',
+      'StrictHostKeyChecking=yes',
+      '-o',
+      `UserKnownHostsFile=${stored.knownHostsPath}`,
+      '-o',
+      `HostKeyAlias=${stored.hostKeyAlias}`,
+      ...SSH_KEEPALIVE_ARGS,
+      '-o',
+      `ProxyCommand=${proxyCmd}`,
+      `${stored.loginUser || 'box'}@${stored.hostKeyAlias}`
     ];
   }
 
@@ -782,6 +806,24 @@ export class SshService implements vscode.Disposable {
       } catch (err: any) {
         this.log(`Could not chmod private key: ${err?.message || err}`, [keyPath]);
       }
+      return;
+    }
+    // Windows OpenSSH rejects private keys that other local users can read. Strip inherited
+    // ACEs and grant only the current user, without prompting (best effort; logged on failure).
+    const username = process.env.USERNAME;
+    if (!username) {
+      return;
+    }
+    const principal = process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${username}` : username;
+    try {
+      const res = await this.runner.execFile('icacls', [keyPath, '/inheritance:r', '/grant:r', `${principal}:F`]);
+      if (res.exitCode === 0) {
+        this.log('Restricted Windows ACL on SSH private key to the current user.', [keyPath]);
+      } else {
+        this.log(`icacls could not restrict private key ACL: ${res.stderr || res.stdout}`, [keyPath]);
+      }
+    } catch (err: any) {
+      this.log(`icacls failed: ${err?.message || err}`, [keyPath]);
     }
   }
 
@@ -1021,6 +1063,30 @@ export class SshService implements vscode.Disposable {
           }
           await this.fixKeyPermissionsQuietly(config.keyPath);
 
+          // transport "proxy-command" is the shared-machine setting: the integrated terminal must
+          // not open the unauthenticated loopback forwarder either, so route it through the broker.
+          if (settings.transport === 'proxy-command') {
+            const proxyCmd = await this.buildSdkProxyCommand(
+              boxId,
+              this.credentials.getRestUrl(),
+              config.targetPort || 22
+            );
+            if (!proxyCmd) {
+              throw new Error(
+                'boxlite.ssh.transport is "proxy-command" but no Node.js executable was found for the ProxyCommand relay. Install Node.js or set the transport to "auto".'
+              );
+            }
+            const proxyArgs = this.buildSdkProxyArgs(config, proxyCmd);
+            this.openSshTerminal(
+              boxId,
+              resolvedName,
+              openSsh.sshBin,
+              proxyArgs,
+              formatShellCommand(openSsh.sshBin, proxyArgs)
+            );
+            return;
+          }
+
           const { port: localPort } = await this.forwarderManager.ensureForwarder(
             boxId,
             config.targetPort || 22
@@ -1232,21 +1298,7 @@ export class SshService implements vscode.Disposable {
 
       let args: string[];
       if (proxyCmd) {
-        args = [
-          '-i',
-          stored.keyPath,
-          '-o',
-          'IdentitiesOnly=yes',
-          '-o',
-          'StrictHostKeyChecking=yes',
-          '-o',
-          `UserKnownHostsFile=${stored.knownHostsPath}`,
-          '-o',
-          `HostKeyAlias=${stored.hostKeyAlias}`,
-          '-o',
-          `ProxyCommand=${proxyCmd}`,
-          `${stored.loginUser || 'box'}@${stored.hostKeyAlias}`
-        ];
+        args = this.buildSdkProxyArgs(stored, proxyCmd);
       } else {
         const { port: localPort } = await this.forwarderManager.ensureForwarder(boxId, targetPort);
         args = this.buildSdkLoopbackArgs(
